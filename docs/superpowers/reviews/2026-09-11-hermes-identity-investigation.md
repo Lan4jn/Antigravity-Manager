@@ -160,4 +160,3 @@ src-tauri/src/proxy/mappers/claude/request.rs:11-27
 ## 开发目标
 
 在不修改 Hermes、不减少其能力、不破坏 prompt cache 的前提下，让 `Antigravity-Manager` 将 Hermes 的规范 Agent 身份归一化为上游支持的 Antigravity 身份，使 `/v1/chat/completions` 与 `/v1/responses` 的完整 Hermes 请求稳定成功，并保持所有非 Hermes system prompt 字节不变。
-
