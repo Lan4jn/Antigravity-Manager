@@ -767,6 +767,10 @@
       "request_timeout_hint": "默认 120 秒，范围 30-7200 秒。修改后需重启服务生效。",
       "enable_logging": "启用请求日志",
       "enable_logging_hint": "记录历史记录以便调试 (微小性能损耗)",
+      "log_retention_title": "请求日志保留",
+      "log_retention_body_hours": "请求体保留小时数",
+      "log_retention_age_days": "日志保留天数",
+      "log_retention_rows": "最大日志行数",
       "upstream_proxy": {
         "title": "全局上游代理 (Global Proxy)",
         "desc": "开启后，应用内所有外部请求（API 反代、Token 刷新、配额查询、更新检测）都将通过此代理。",
@@ -805,6 +809,8 @@
       "circuit_breaker": {
         "title": "自适应熔断器",
         "tooltip": "当账号因配额耗尽反复失败时，自动增加锁定时间。这可以防止在死账号上浪费 API 调用，同时允许瞬态错误快速恢复。",
+        "lock_on_zero_quota": "零配额持续熔断 (5小时 / 周配额)",
+        "lock_on_zero_quota_desc": "开启后，若账号 5 小时滚动窗口或周配额用光 (0%)，立即将其锁定至官方重置时间，跳过短阶梯退避并杜绝无效调用。提示：本功能的状态获取与自动解禁依赖「常规设置」中的「自动刷新配额」。",
         "backoff_levels": "退避等级 (秒)",
         "input_placeholder": "输入退避时长 (秒)，以逗号分隔",
         "level": "等级 {{level}}",
@@ -1416,7 +1422,8 @@
       "quickConfig": "一键配置本地开发环境",
       "syncDesc": "同步至官方标准配置",
       "codexTooltip": "将 API Key 与 BaseURL 同步至 Codex / ChatGPT CLI",
-      "claudeTooltip": "将 API Key 与 BaseURL 同步至 Claude Code"
+      "claudeTooltip": "将 API Key 与 BaseURL 同步至 Claude Code",
+      "opencodeTooltip": "将 API Key、BaseURL 和模型同步至 OpenCode"
     },
     "models": {
       "title": "可用模型",

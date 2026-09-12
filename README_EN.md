@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional AI Account Management & Protocol Proxy System (v4.6.9)
+> Professional AI Account Management & Protocol Proxy System (v4.7.1)
 
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
@@ -9,7 +9,7 @@
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.6.9-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.7.1-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -224,6 +224,7 @@ cd docker
 # 2. Start the service
 docker compose up -d
 ```
+> **Log rotation**: Compose limits JSON logs to `100m` per file and keeps `3` files by default to prevent unbounded growth.
 > **Access URL**: `http://localhost:8045` (Admin Console) | `http://localhost:8045/v1` (API Base)
 > **System Requirements**:
 > - **RAM**: **1GB** recommended (minimum 256MB).
@@ -231,7 +232,8 @@ docker compose up -d
 > - **Architecture**: Supports x86_64 and ARM64.
 > **See**: [Docker Deployment Guide (docker)](./docker/README.md)
 
-### 🛠️ Troubleshooting
+<details>
+<summary><b>🛠️ Troubleshooting - Click to expand</b></summary>
 
 #### macOS says "App is damaged"?
 Due to macOS security gatekeeper, non-App Store apps might show this. Run this in Terminal to fix:
@@ -249,6 +251,8 @@ env WEBKIT_DISABLE_DMABUF_RENDERER=1 ANTIGRAVITY_FORCE_WAYLAND=1 antigravity-too
 - `ANTIGRAVITY_FORCE_WAYLAND=1`: keep native Wayland (do not force X11)
 - `ANTIGRAVITY_FORCE_X11=1`: force X11 if you still need it
 - `WEBKIT_DISABLE_DMABUF_RENDERER=1`: disable the WebKit DMA-BUF renderer
+
+</details>
 
 ## 🔌 Quick Integration Examples
 
@@ -346,6 +350,9 @@ with open("output.png", "wb") as f:
 - **`n`**: Number of images to generate (1-10)
 - **`response_format`**: `"b64_json"` or `"url"` (Data URI)
 
+<details>
+<summary><b>🎨 Expand to view more image generation methods & parameter mapping rules (Chat API / Model Suffix / Cherry Studio)</b></summary>
+
 #### Method 2: Chat API + Parameters (✨ New)
 
 **All protocols** (OpenAI, Claude) Chat APIs now support direct `size` and `quality` parameters:
@@ -435,13 +442,16 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 - `quality: "hd"` → Mapped to `4K` resolution
 - `quality: "medium"` → Mapped to `2K` resolution
 
+</details>
+
 ## 📝 Changelog
 
-> Latest version **v4.6.9** (2026-09-08): Comprehensive multi-protocol agent stability enhancements: decoupled Responses session routing & signature keys, honor store:false to eliminate memory leaks, fixed 429 failover loops & circuit breaker bypass, added Gemini first-turn user primer resolving autonomous agent 400 turn errors, and supported /accounts/switch targetIde to avoid unwanted IDE restarts.
+> Latest version **v4.7.1** (2026-09-12): Native language server reverse-engineering alignment with dynamic on-demand Agent requestType, fine-grained 429 classification to prevent false lockouts, MALFORMED_FUNCTION_CALL normalization and blank response self-healing, one-click sync of APIKEY.FUN credentials and models to OpenCode, atomic file writes with physical fsync for accounts and configurations, resolved reset_time NaN countdown and isolated model-level zero-quota circuit breaking, automated request log retention and incremental vacuum, proxy password decryption failure alerts and URL fallback, Claude signature log demotion and Docker Compose log rotation, and highlighted active switches in dark mode.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 
-## 👥 Contributors
+<details>
+<summary><b>👥 Contributors - Click to expand</b></summary>
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
@@ -474,7 +484,10 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 Special thanks to all developers who have contributed to this project.
 
-## 🤝 Special Thanks
+</details>
+
+<details>
+<summary><b>🤝 Special Thanks - Click to expand</b></summary>
 
 This project has referenced or learned from the ideas or code of the following excellent open-source projects during its development (in no particular order):
 
@@ -486,6 +499,8 @@ This project has referenced or learned from the ideas or code of the following e
 *   [aistudio-gemini-proxy](https://github.com/zhongruichen/aistudio-gemini-proxy)
 *   [gcli2api](https://github.com/su-kaka/gcli2api)
 *   [agent-vibes](https://github.com/funny-vibes/agent-vibes)
+
+</details>
 
 *   **License**: **CC BY-NC-SA 4.0**. Strictly for non-commercial use.
 *   **Security**: All account data is encrypted and stored locally in a SQLite database. Data never leaves your device unless sync is enabled.

@@ -774,6 +774,10 @@
       "request_timeout_hint": "Default 120s, range 30-7200s. Restart service to apply changes.",
       "enable_logging": "Enable Request Logging",
       "enable_logging_hint": "Record history for debugging (Minor perf cost)",
+      "log_retention_title": "Request log retention",
+      "log_retention_body_hours": "Request body age (hours)",
+      "log_retention_age_days": "Log age (days)",
+      "log_retention_rows": "Maximum log rows",
       "upstream_proxy": {
         "title": "Global Upstream Proxy (Global Proxy)",
         "desc": "When enabled, all external requests (API Proxy, Token Refresh, Quota Check, Update Check) will be routed through this proxy.",
@@ -812,6 +816,8 @@
       "circuit_breaker": {
         "title": "Adaptive Circuit Breaker",
         "tooltip": "Automatically increases lockout duration for accounts that repeatedly fail with quota exhaustion. This prevents wasting API calls on dead accounts while allowing transient errors to recover quickly.",
+        "lock_on_zero_quota": "Lock on Zero Quota (5h / Weekly)",
+        "lock_on_zero_quota_desc": "Automatically locks the account until its exact quota reset time whenever 5-hour rolling or weekly quota hits 0%, skipping short backoffs. Note: Quota state discovery and automatic recovery depend on 'Auto Refresh Quotas' in General Settings.",
         "backoff_levels": "Backoff Levels (Seconds)",
         "input_placeholder": "Enter backoff durations in seconds, separated by commas",
         "level": "Lv {{level}}",
@@ -1451,7 +1457,8 @@
       "quickConfig": "One-Click Local Dev Setup",
       "syncDesc": "Sync to official standard configuration",
       "codexTooltip": "Sync API Key & BaseURL to Codex / ChatGPT CLI",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
+      "claudeTooltip": "Sync API Key & BaseURL to Claude Code",
+      "opencodeTooltip": "Sync API Key, BaseURL and models to OpenCode"
     },
     "models": {
       "title": "Available Models",

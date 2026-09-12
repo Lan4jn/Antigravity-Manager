@@ -48,19 +48,51 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::task::spawn_blocking(
-            move || match crate::modules::proxy_db::cleanup_old_logs(30) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+        let retention = crate::modules::config::load_app_config()
+            .map(|config| config.proxy.log_retention)
+            .unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            match crate::modules::proxy_db::apply_retention(&retention) {
+                Ok((cleared, deleted)) => {
+                    if cleared > 0 || deleted > 0 {
+                        tracing::info!(
+                            "Proxy log retention: cleared {} bodies, deleted {} rows",
+                            cleared,
+                            deleted
+                        );
                     }
                 }
                 Err(e) => {
                     tracing::error!("Failed to cleanup old logs: {}", e);
                 }
-            },
-        );
+            }
+        });
+
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let retention = crate::modules::config::load_app_config()
+                    .map(|config| config.proxy.log_retention)
+                    .unwrap_or_default();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::modules::proxy_db::apply_retention(&retention)
+                })
+                .await;
+                match result {
+                    Ok(Ok((cleared, deleted))) => tracing::info!(
+                        "Proxy log retention: cleared {} bodies, deleted {} rows",
+                        cleared,
+                        deleted
+                    ),
+                    Ok(Err(error)) => {
+                        tracing::error!("Failed to apply proxy log retention: {}", error)
+                    }
+                    Err(error) => tracing::error!("Proxy log retention task failed: {}", error),
+                }
+            }
+        });
 
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),

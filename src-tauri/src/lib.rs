@@ -692,6 +692,7 @@ pub fn run() {
             proxy::opencode_sync::get_opencode_sync_status,
             proxy::opencode_sync::get_canonical_families,
             proxy::opencode_sync::execute_opencode_sync,
+            proxy::opencode_sync::execute_opencode_openai_sync,
             proxy::opencode_sync::execute_opencode_restore,
             proxy::opencode_sync::get_opencode_config_content,
             proxy::opencode_sync::execute_opencode_clear,

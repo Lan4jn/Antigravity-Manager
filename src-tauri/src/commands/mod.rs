@@ -38,15 +38,18 @@ pub async fn list_accounts(
                 .get_rate_limit_reset_seconds(&account.id)
             {
                 if reset_secs > 0 {
+                    let reset_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        chrono::Utc::now().timestamp() + reset_secs as i64,
+                        0,
+                    )
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default();
+
                     if let Some(ref mut quota_data) = account.quota {
                         for model in &mut quota_data.models {
                             model.percentage = 0;
-                            model.reset_time =
-                                (chrono::Utc::now().timestamp() + reset_secs as i64).to_string();
+                            model.reset_time = reset_iso.clone();
                         }
-                        // Optionally, add a UI flag if we want it to look completely blocked
-                        // quota_data.is_forbidden = true;
-                        // quota_data.forbidden_reason = Some(format!("Quota exhausted or rate limited (resets in {}s)", reset_secs));
                     }
                 }
             }
@@ -256,10 +259,16 @@ pub async fn fetch_account_quota(
             .get_rate_limit_reset_seconds(&account_id)
         {
             if reset_secs > 0 {
+                let reset_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                    chrono::Utc::now().timestamp() + reset_secs as i64,
+                    0,
+                )
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
+
                 for model in &mut quota.models {
                     if model.percentage == 0 {
-                        model.reset_time =
-                            (chrono::Utc::now().timestamp() + reset_secs as i64).to_string();
+                        model.reset_time = reset_iso.clone();
                     }
                 }
             }

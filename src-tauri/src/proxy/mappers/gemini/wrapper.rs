@@ -797,9 +797,15 @@ pub fn wrap_request_v2(
     }
 
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
+    // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
     if let Some(account_id_str) = account_id {
-        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
-            account_id_str
+        let fingerprint = session_id.unwrap_or("default");
+        let generation =
+            crate::proxy::common::session::current_bump(account_id_str, fingerprint);
+        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
+            account_id_str,
+            fingerprint,
+            generation
         ));
     }
 
@@ -845,11 +851,20 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [NEW] 3. 条件注入 enabledCreditTypes
-    // 这是官方 Worker 极高权重的一个指纹字段。
-    // 只有在非图像生成请求（即 agent 类型请求）时注入，避免图像生成场景出现 Credit 判定异常。
-    // 特别注意：这是 Google 识别“官方客户端”的重要凭证之一。
-    let is_agent_request = config.request_type != "image_gen";
+    // [NEW] 3. 动态判断是否需要 agent requestType 与 enabledCreditTypes
+    // 对齐官方语言服务原生设计：只有存在工具定义 (tools) 或包含工具调用上下文时才进入 agent 模式。
+    // 普通问答、纯文本补全不注入 requestType: "agent"，避开 Google 后端针对 Agent 资源池的过载限流。
+    let has_tools = inner_request
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+    let has_tool_interactions = inner_request
+        .get("contents")
+        .map(crate::proxy::mappers::common_utils::contents_has_tool_interactions)
+        .unwrap_or(false);
+
+    let is_agent_request = config.request_type != "image_gen" && (has_tools || has_tool_interactions);
 
     // [CACHE] 重建 inner_request 字段顺序——稳定前缀在前，动态内容在后
     // 遵循 Google 官方建议："将较大且常见的内容放置在提示的开头"
@@ -897,12 +912,14 @@ pub fn wrap_request_v2(
         "request": reordered_inner,
         "model": config.final_model,
         "userAgent": official_user_agent,
-        "requestType": if is_agent_request { "agent" } else { "image_gen" },
         // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
         "requestId": official_request_id,
     });
 
-    if is_agent_request {
+    if config.request_type == "image_gen" {
+        final_request_obj["requestType"] = json!("image_gen");
+    } else if is_agent_request {
+        final_request_obj["requestType"] = json!("agent");
         if let Some(obj) = final_request_obj.as_object_mut() {
             // 强制注入 Google One AI 信用额度支持标号
             obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));
