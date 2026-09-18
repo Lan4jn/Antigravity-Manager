@@ -141,7 +141,7 @@ pub struct TokenManager {
     data_dir: PathBuf,
     rate_limit_tracker: Arc<RateLimitTracker>, // 新增: 限流跟踪器
     sticky_config: Arc<tokio::sync::RwLock<StickySessionConfig>>, // 新增：调度配置
-    session_accounts: Arc<DashMap<String, String>>, // 新增：会话与账号映射 (SessionID -> AccountID)
+    session_accounts: Arc<DashMap<String, (String, std::time::Instant)>>, // 会话与账号映射 (SessionID -> (AccountID, LastAccessed))
     preferred_account_id: Arc<tokio::sync::RwLock<Option<String>>>, // [FIX #820] 优先使用的账号ID（固定账号模式）
     health_scores: Arc<DashMap<String, f32>>,                       // account_id -> health_score
     circuit_breaker_config: Arc<tokio::sync::RwLock<crate::models::CircuitBreakerConfig>>, // [NEW] 熔断配置缓存
@@ -214,20 +214,22 @@ impl TokenManager {
         }
     }
 
-    /// 启动限流记录自动清理后台任务（每15秒检查并清除过期记录）
+    /// 启动限流记录与过期会话自动清理后台任务（每15秒清理过期限流，每60秒清理过期会话）
     pub async fn start_auto_cleanup(&self) {
         let tracker = self.rate_limit_tracker.clone();
+        let session_accounts = self.session_accounts.clone();
         let cancel = self.cancel_token.child_token();
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut rate_limit_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut session_interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         tracing::info!("Auto-cleanup task received cancel signal");
                         break;
                     }
-                    _ = interval.tick() => {
+                    _ = rate_limit_interval.tick() => {
                         let cleaned = tracker.cleanup_expired();
                         if cleaned > 0 {
                             tracing::info!(
@@ -235,6 +237,12 @@ impl TokenManager {
                                 cleaned
                             );
                         }
+                    }
+                    _ = session_interval.tick() => {
+                        Self::cleanup_expired_sessions_map(
+                            &session_accounts,
+                            std::time::Duration::from_secs(2 * 3600),
+                        );
                     }
                 }
             }
@@ -248,7 +256,7 @@ impl TokenManager {
         }
         *guard = Some(handle);
 
-        tracing::info!("Rate limit auto-cleanup task started (interval: 15s)");
+        tracing::info!("Auto-cleanup task started (rate_limit: 15s, session_accounts: 60s)");
     }
 
     /// 从主应用账号目录加载所有账号
@@ -351,7 +359,7 @@ impl TokenManager {
         }
         self.health_scores.remove(account_id);
         self.rate_limit_tracker.clear(account_id);
-        self.session_accounts.retain(|_, v| v != account_id);
+        self.session_accounts.retain(|_, v| v.0 != account_id);
         if let Ok(mut preferred) = self.preferred_account_id.try_write() {
             if preferred.as_deref() == Some(account_id) {
                 *preferred = None;
@@ -1906,8 +1914,15 @@ impl TokenManager {
             {
                 let sid = session_id.unwrap();
 
-                // 1. 检查会话是否已绑定账号
-                if let Some(bound_id) = self.session_accounts.get(sid).map(|v| v.clone()) {
+                // 1. 检查会话是否已绑定账号（命中时更新最后活跃时间戳）
+                let bound_id = if let Some(mut entry) = self.session_accounts.get_mut(sid) {
+                    entry.1 = std::time::Instant::now();
+                    Some(entry.0.clone())
+                } else {
+                    None
+                };
+
+                if let Some(bound_id) = bound_id {
                     // 【修复】先通过 account_id 找到对应的账号，获取其 email
                     // 2. 转换 email -> account_id 检查绑定的账号是否限流
                     if let Some(bound_token) =
@@ -2023,8 +2038,10 @@ impl TokenManager {
                         // 如果是会话首次分配且需要粘性，在此建立绑定
                         if let Some(sid) = session_id {
                             if scheduling.mode != SchedulingMode::PerformanceFirst {
-                                self.session_accounts
-                                    .insert(sid.to_string(), selected.account_id.clone());
+                                self.session_accounts.insert(
+                                    sid.to_string(),
+                                    (selected.account_id.clone(), std::time::Instant::now()),
+                                );
                                 tracing::debug!(
                                     "Sticky Session: Bound new account {} to session {}",
                                     selected.email,
@@ -3435,9 +3452,54 @@ impl TokenManager {
         self.session_accounts.remove(session_id);
     }
 
+    /// 解绑指定 session 的账号映射（别名）
+    #[allow(dead_code)]
+    pub fn unbind_session(&self, session_id: &str) {
+        self.clear_session_binding(session_id);
+    }
+
     /// 清除所有会话的粘性映射
     pub fn clear_all_sessions(&self) {
         self.session_accounts.clear();
+    }
+
+    /// 清除所有会话的粘性映射（别名）
+    #[allow(dead_code)]
+    pub fn clear_session_bindings(&self) {
+        self.clear_all_sessions();
+    }
+
+    /// 清理已过期的会话绑定记录
+    pub fn cleanup_expired_sessions(&self, max_age: std::time::Duration) -> usize {
+        Self::cleanup_expired_sessions_map(&self.session_accounts, max_age)
+    }
+
+    /// 内部辅助函数：清理 DashMap 中超过指定时长的会话记录
+    pub(crate) fn cleanup_expired_sessions_map(
+        session_accounts: &DashMap<String, (String, std::time::Instant)>,
+        max_age: std::time::Duration,
+    ) -> usize {
+        let now = std::time::Instant::now();
+        let mut cleaned = 0;
+        session_accounts.retain(|_, (_, last_accessed)| {
+            let is_expired = now
+                .checked_duration_since(*last_accessed)
+                .map_or(false, |dur| dur > max_age);
+            if is_expired {
+                cleaned += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if cleaned > 0 {
+            tracing::info!(
+                "Cleaned up {} expired session account mapping(s) (max_age: {:?})",
+                cleaned,
+                max_age
+            );
+        }
+        cleaned
     }
 
     // ===== [FIX #820] 固定账号模式相关方法 =====
@@ -3820,7 +3882,7 @@ impl TokenManager {
         .await?;
 
         // Clear sticky session if blocked
-        self.session_accounts.retain(|_, v| *v != account_id);
+        self.session_accounts.retain(|_, v| v.0 != account_id);
 
         tracing::info!(
             "🚫 Account {} validation blocked until {} (reason: {})",
@@ -3849,7 +3911,7 @@ impl TokenManager {
         crate::modules::account::mark_account_forbidden(account_id, reason)?;
 
         // Clear sticky session if forbidden
-        self.session_accounts.retain(|_, v| *v != account_id);
+        self.session_accounts.retain(|_, v| v.0 != account_id);
 
         // [FIX] 从内存池中移除账号，避免重试时再次选中
         self.remove_account(account_id);
@@ -3999,7 +4061,7 @@ mod tests {
         // Prime extra caches to ensure remove_account() is really called.
         manager
             .session_accounts
-            .insert("sid1".to_string(), account_id.to_string());
+            .insert("sid1".to_string(), (account_id.to_string(), std::time::Instant::now()));
         {
             let mut preferred = manager.preferred_account_id.write().await;
             *preferred = Some(account_id.to_string());
@@ -4500,7 +4562,7 @@ mod tests {
             .unwrap();
         assert_eq!(account_id, "acc1");
         assert_eq!(
-            manager.session_accounts.get("sid1").map(|v| v.clone()),
+            manager.session_accounts.get("sid1").map(|v| v.0.clone()),
             Some("acc1".to_string())
         );
 
@@ -4517,7 +4579,7 @@ mod tests {
         assert_eq!(email, "b@test.com");
         assert!(manager.tokens.get("acc1").is_none());
         assert_ne!(
-            manager.session_accounts.get("sid1").map(|v| v.clone()),
+            manager.session_accounts.get("sid1").map(|v| v.0.clone()),
             Some("acc1".to_string())
         );
 
@@ -5290,5 +5352,62 @@ mod tests {
             ],
             "Sonnet should sort by quota first, then by tier as tiebreaker"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_sessions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp_dir.path().to_path_buf());
+
+        let now = std::time::Instant::now();
+        let past = now
+            .checked_sub(std::time::Duration::from_secs(100))
+            .expect("Instant sub overflow");
+
+        // 插入一个过期会话和一个活跃会话
+        manager.session_accounts.insert(
+            "expired_session".to_string(),
+            ("acc_expired".to_string(), past),
+        );
+        manager.session_accounts.insert(
+            "active_session".to_string(),
+            ("acc_active".to_string(), now),
+        );
+
+        // 使用 50 秒作为过期阈值进行清理
+        let max_age = std::time::Duration::from_secs(50);
+        let removed = manager.cleanup_expired_sessions(max_age);
+
+        assert_eq!(removed, 1, "应该只清理 1 个过期会话");
+        assert!(
+            !manager.session_accounts.contains_key("expired_session"),
+            "过期会话应被移除"
+        );
+        assert!(
+            manager.session_accounts.contains_key("active_session"),
+            "活跃会话应被保留"
+        );
+        assert_eq!(
+            manager
+                .session_accounts
+                .get("active_session")
+                .map(|v| v.0.clone()),
+            Some("acc_active".to_string())
+        );
+
+        // 再次清理，应无会话被移除
+        let removed_again = manager.cleanup_expired_sessions(max_age);
+        assert_eq!(removed_again, 0, "再次清理不应移除任何未过期会话");
+
+        // 测试别名方法 unbind_session 和 clear_session_bindings
+        manager.session_accounts.insert(
+            "session_to_unbind".to_string(),
+            ("acc_to_unbind".to_string(), now),
+        );
+        manager.unbind_session("session_to_unbind");
+        assert!(!manager.session_accounts.contains_key("session_to_unbind"));
+
+        manager.clear_session_bindings();
+        assert!(manager.session_accounts.is_empty());
     }
 }
