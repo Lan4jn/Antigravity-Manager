@@ -38,6 +38,25 @@ impl<T> CacheEntry<T> {
     }
 }
 
+/// Evict the oldest entries by timestamp when cache exceeds limit,
+/// even if none of the entries are expired yet.
+fn evict_oldest_if_needed<V, F>(cache: &mut HashMap<String, V>, limit: usize, mut get_time: F)
+where
+    F: FnMut(&V) -> SystemTime,
+{
+    while cache.len() > limit {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, v)| get_time(v))
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest_key);
+        } else {
+            break;
+        }
+    }
+}
+
 /// Triple-layer signature cache to handle:
 /// 1. Signature recovery for tool calls (when clients strip them)
 /// 2. Cross-model compatibility checks (preventing Claude signatures on Gemini models)
@@ -94,10 +113,11 @@ impl SignatureCache {
             );
             cache.insert(tool_use_id.to_string(), CacheEntry::new(signature));
 
-            // Clean up expired entries when limit is reached
+            // Clean up expired entries and enforce capacity limit via LRU eviction
             if cache.len() > TOOL_CACHE_LIMIT {
                 let before = cache.len();
                 cache.retain(|_, v| !v.is_expired());
+                evict_oldest_if_needed(&mut cache, TOOL_CACHE_LIMIT, |v| v.timestamp);
                 let after = cache.len();
                 if before != after {
                     tracing::debug!(
@@ -143,6 +163,7 @@ impl SignatureCache {
             if cache.len() > FAMILY_CACHE_LIMIT {
                 let before = cache.len();
                 cache.retain(|_, v| !v.is_expired());
+                evict_oldest_if_needed(&mut cache, FAMILY_CACHE_LIMIT, |v| v.timestamp);
                 let after = cache.len();
                 if before != after {
                     tracing::debug!(
@@ -153,6 +174,12 @@ impl SignatureCache {
                 }
             }
         }
+    }
+
+    /// Alias for cache_thinking_family
+    #[inline]
+    pub fn set_thinking_family(&self, signature: String, family: String) {
+        self.cache_thinking_family(signature, family);
     }
 
     /// Get model family for a signature
@@ -240,6 +267,7 @@ impl SignatureCache {
             if cache.len() > SESSION_CACHE_LIMIT {
                 let before = cache.len();
                 cache.retain(|_, v| !v.is_expired());
+                evict_oldest_if_needed(&mut cache, SESSION_CACHE_LIMIT, |v| v.timestamp);
                 let after = cache.len();
                 if before != after {
                     tracing::info!(
@@ -308,6 +336,16 @@ impl SignatureCache {
             return;
         }
 
+        // Prevent excessively large vector allocations from abnormal/malicious turn_index
+        if turn_index > 500 {
+            tracing::warn!(
+                "[SignatureCache] turn_index {} exceeds limit (500) for session {}, ignoring reasoning",
+                turn_index,
+                session_id
+            );
+            return;
+        }
+
         if let Ok(mut cache) = self.session_reasonings.lock() {
             let entry = cache
                 .entry(session_id.to_string())
@@ -337,6 +375,7 @@ impl SignatureCache {
             if cache.len() > SESSION_CACHE_LIMIT {
                 let before = cache.len();
                 cache.retain(|_, v| !v.is_expired());
+                evict_oldest_if_needed(&mut cache, SESSION_CACHE_LIMIT, |v| v.timestamp);
                 let after = cache.len();
                 if before != after {
                     tracing::debug!(
@@ -347,6 +386,12 @@ impl SignatureCache {
                 }
             }
         }
+    }
+
+    /// Alias for cache_session_reasoning
+    #[inline]
+    pub fn append_reasoning(&self, session_id: &str, reasoning: String, turn_index: usize) {
+        self.cache_session_reasoning(session_id, reasoning, turn_index);
     }
 
     /// Retrieve reasoning text for a specific assistant turn in a session
@@ -398,6 +443,26 @@ impl SignatureCache {
         if let Ok(mut cache) = self.session_reasonings.lock() {
             cache.clear();
         }
+    }
+
+    #[cfg(test)]
+    pub fn tool_cache_len(&self) -> usize {
+        self.tool_signatures.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn family_cache_len(&self) -> usize {
+        self.thinking_families.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn session_cache_len(&self) -> usize {
+        self.session_signatures.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn reasoning_cache_len(&self) -> usize {
+        self.session_reasonings.lock().unwrap().len()
     }
 }
 
@@ -495,5 +560,102 @@ mod tests {
         assert!(cache.get_tool_signature("tool_1").is_none());
         assert!(cache.get_signature_family(&sig).is_none());
         assert!(cache.get_session_signature("sid-1").is_none());
+    }
+
+    #[test]
+    fn test_tool_cache_unexpired_lru_eviction() {
+        let cache = SignatureCache::new();
+        let sig = "x".repeat(60);
+
+        // Insert first item and sleep briefly to guarantee strictly older timestamp
+        cache.cache_tool_signature("tool_oldest", sig.clone());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for i in 0..TOOL_CACHE_LIMIT {
+            cache.cache_tool_signature(&format!("tool_{}", i), sig.clone());
+        }
+
+        // Total inserted is TOOL_CACHE_LIMIT + 1, all unexpired
+        // Cache size must strictly not exceed TOOL_CACHE_LIMIT
+        assert_eq!(cache.tool_cache_len(), TOOL_CACHE_LIMIT);
+
+        // Oldest item must have been evicted
+        assert_eq!(cache.get_tool_signature("tool_oldest"), None);
+
+        // Most recently inserted item must still exist
+        assert_eq!(
+            cache.get_tool_signature(&format!("tool_{}", TOOL_CACHE_LIMIT - 1)),
+            Some(sig)
+        );
+    }
+
+    #[test]
+    fn test_family_cache_unexpired_lru_eviction() {
+        let cache = SignatureCache::new();
+        let oldest_sig = format!("{}_oldest", "y".repeat(50));
+        cache.set_thinking_family(oldest_sig.clone(), "family_oldest".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for i in 0..FAMILY_CACHE_LIMIT {
+            let sig = format!("{}_{:04}", "y".repeat(50), i);
+            cache.set_thinking_family(sig, format!("family_{}", i));
+        }
+
+        assert_eq!(cache.family_cache_len(), FAMILY_CACHE_LIMIT);
+        assert_eq!(cache.get_signature_family(&oldest_sig), None);
+    }
+
+    #[test]
+    fn test_session_cache_unexpired_lru_eviction() {
+        let cache = SignatureCache::new();
+        let sig = "z".repeat(60);
+
+        cache.cache_session_signature("session_oldest", sig.clone(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for i in 0..SESSION_CACHE_LIMIT {
+            cache.cache_session_signature(&format!("session_{}", i), sig.clone(), 1);
+        }
+
+        assert_eq!(cache.session_cache_len(), SESSION_CACHE_LIMIT);
+        assert_eq!(cache.get_session_signature("session_oldest"), None);
+        assert!(cache
+            .get_session_signature(&format!("session_{}", SESSION_CACHE_LIMIT - 1))
+            .is_some());
+    }
+
+    #[test]
+    fn test_append_reasoning_turn_index_protection() {
+        let cache = SignatureCache::new();
+
+        // Normal turn_index <= 500 should succeed
+        cache.append_reasoning("sess_1", "valid reasoning".to_string(), 500);
+        assert_eq!(
+            cache.get_session_reasoning("sess_1"),
+            Some("valid reasoning".to_string())
+        );
+
+        // turn_index > 500 should be ignored (no huge resize or panic)
+        cache.append_reasoning("sess_malicious", "attack".to_string(), 501);
+        assert_eq!(cache.get_session_reasoning("sess_malicious"), None);
+        assert_eq!(cache.reasoning_cache_len(), 1);
+    }
+
+    #[test]
+    fn test_reasoning_cache_unexpired_lru_eviction() {
+        let cache = SignatureCache::new();
+
+        cache.append_reasoning("session_oldest", "reasoning_0".to_string(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for i in 0..SESSION_CACHE_LIMIT {
+            cache.append_reasoning(&format!("session_{}", i), format!("reasoning_{}", i), 0);
+        }
+
+        assert_eq!(cache.reasoning_cache_len(), SESSION_CACHE_LIMIT);
+        assert_eq!(cache.get_session_reasoning("session_oldest"), None);
+        assert!(cache
+            .get_session_reasoning(&format!("session_{}", SESSION_CACHE_LIMIT - 1))
+            .is_some());
     }
 }

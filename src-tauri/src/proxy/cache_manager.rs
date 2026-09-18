@@ -129,6 +129,31 @@ pub struct CacheManager {
     prefix_stats: std::sync::RwLock<(u64, u64, u64)>,
 }
 
+/// 当 DashMap 大小超过 limit 且清除过期条目后仍超过 limit 时，
+/// 淘汰时间戳最旧的条目直至 map.len() <= limit。
+///
+/// 注意 DashMap 的操作安全：
+/// 迭代器和 Entry 读锁必须在作用域内完全释放，之后再调用 remove，
+/// 严禁持有 DashMap shard 读锁的同时调用 remove，否则会导致死锁。
+fn evict_oldest_dashmap<V, T: Ord, F>(map: &DashMap<String, V>, limit: usize, mut get_time: F)
+where
+    F: FnMut(&V) -> T,
+{
+    while map.len() > limit {
+        let oldest_key = {
+            let iter = map.iter();
+            iter.min_by_key(|entry| get_time(entry.value()))
+                .map(|entry| entry.key().clone())
+        };
+
+        if let Some(key) = oldest_key {
+            map.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
 impl CacheManager {
     /// 创建新的 CacheManager
     pub fn new() -> Self {
@@ -234,11 +259,12 @@ impl CacheManager {
             &raw_hash[..raw_hash.len().min(16)]
         );
 
-        // LRU 淘汰: 超出限制时清除过期条目
+        // LRU 淘汰: 超出限制时清除过期条目与最旧未过期条目
         if self.si_cache.len() > SI_CACHE_LIMIT {
             let before = self.si_cache.len();
             self.si_cache
                 .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
+            evict_oldest_dashmap(&self.si_cache, SI_CACHE_LIMIT, |v| v.timestamp);
             let after = self.si_cache.len();
             if before != after {
                 tracing::debug!(
@@ -335,6 +361,7 @@ impl CacheManager {
             let before = self.tools_cache.len();
             self.tools_cache
                 .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
+            evict_oldest_dashmap(&self.tools_cache, TOOLS_CACHE_LIMIT, |v| v.timestamp);
             let after = self.tools_cache.len();
             if before != after {
                 tracing::debug!(
@@ -463,6 +490,7 @@ impl CacheManager {
             let before = self.prefix_tracker.len();
             let now = Instant::now();
             self.prefix_tracker.retain(|_, v| v.expires_at > now);
+            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| v.created_at);
             let after = self.prefix_tracker.len();
             if before != after {
                 tracing::debug!(
@@ -473,6 +501,20 @@ impl CacheManager {
                 );
             }
         }
+    }
+
+    /// 插入或更新 Layer 3 前缀条目（insert_prefix 别名）
+    #[inline]
+    pub fn track_prefix(
+        &self,
+        hash: String,
+        cache_name: String,
+        si_hash: String,
+        tools_hash: String,
+        model: String,
+        ttl_secs: Option<u64>,
+    ) {
+        self.insert_prefix(hash, cache_name, si_hash, tools_hash, model, ttl_secs);
     }
 
     /// 记录一次隐式缓存命中（来自响应的 cachedContentTokenCount > 0）
@@ -990,5 +1032,84 @@ mod tests {
         assert_eq!(stats.si_total, 0);
         assert_eq!(stats.prefix_total, 0);
         assert_eq!(stats.active_si_entries, 0);
+    }
+
+    #[test]
+    fn test_si_cache_capacity_limit_lru() {
+        let cm = CacheManager::new();
+
+        // 插入最旧的项，微小休眠确保时间戳严格在前
+        cm.cache_si("si_oldest".to_string(), "oldest_text".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // 插入 SI_CACHE_LIMIT 个新项
+        for i in 0..SI_CACHE_LIMIT {
+            cm.cache_si(format!("si_{}", i), format!("text_{}", i));
+        }
+
+        // 验证容量严格受限于 SI_CACHE_LIMIT
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_si_entries, SI_CACHE_LIMIT);
+
+        // 最旧项被淘汰
+        assert_eq!(cm.lookup_si("si_oldest"), None);
+
+        // 最新插入的项依然存在
+        let newest_key = format!("si_{}", SI_CACHE_LIMIT - 1);
+        let newest_val = format!("text_{}", SI_CACHE_LIMIT - 1);
+        assert_eq!(cm.lookup_si(&newest_key), Some(newest_val));
+    }
+
+    #[test]
+    fn test_tools_cache_capacity_limit_lru() {
+        let cm = CacheManager::new();
+
+        cm.cache_tools("tools_oldest".to_string(), "{}".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for i in 0..TOOLS_CACHE_LIMIT {
+            cm.cache_tools(format!("tools_{}", i), format!("{{\"id\": {}}}", i));
+        }
+
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_tools_entries, TOOLS_CACHE_LIMIT);
+        assert_eq!(cm.lookup_tools("tools_oldest"), None);
+
+        let newest_key = format!("tools_{}", TOOLS_CACHE_LIMIT - 1);
+        assert!(cm.lookup_tools(&newest_key).is_some());
+    }
+
+    #[test]
+    fn test_prefix_tracker_capacity_limit_lru() {
+        let cm = CacheManager::new();
+
+        cm.track_prefix(
+            "prefix_oldest".to_string(),
+            "cache_oldest".to_string(),
+            "si".to_string(),
+            "tools".to_string(),
+            "model".to_string(),
+            Some(3600),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for i in 0..PREFIX_TRACKER_LIMIT {
+            cm.track_prefix(
+                format!("prefix_{}", i),
+                format!("cache_{}", i),
+                "si".to_string(),
+                "tools".to_string(),
+                "model".to_string(),
+                Some(3600),
+            );
+        }
+
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_prefix_entries, PREFIX_TRACKER_LIMIT);
+        assert_eq!(cm.lookup_prefix("prefix_oldest"), None);
+
+        let newest_key = format!("prefix_{}", PREFIX_TRACKER_LIMIT - 1);
+        let newest_cache_name = format!("cache_{}", PREFIX_TRACKER_LIMIT - 1);
+        assert_eq!(cm.lookup_prefix(&newest_key), Some(newest_cache_name));
     }
 }
