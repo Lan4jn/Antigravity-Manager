@@ -5676,12 +5676,39 @@ use tokio::sync::RwLock as TokioRwLock;
 
 use std::collections::HashMap;
 
-static WEBSOCKET_TOOL_CALL_CACHE: OnceLock<TokioRwLock<HashMap<String, Value>>> = OnceLock::new();
+#[derive(Debug, Clone)]
+struct ToolCallCacheEntry {
+    value: Value,
+    last_accessed: std::time::Instant,
+}
+
+const TOOL_CALL_CACHE_CAP: usize = 500;
+const TOOL_CALL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60); // 30 分钟
+
+static WEBSOCKET_TOOL_CALL_CACHE: OnceLock<TokioRwLock<HashMap<String, ToolCallCacheEntry>>> =
+    OnceLock::new();
 
 pub fn get_cached_tool_call(call_id: &str) -> Option<Value> {
     if let Some(cache) = WEBSOCKET_TOOL_CALL_CACHE.get() {
+        if let Ok(mut guard) = cache.try_write() {
+            if let Some(entry) = guard.get_mut(call_id) {
+                if entry.last_accessed.elapsed() < TOOL_CALL_CACHE_TTL {
+                    entry.last_accessed = std::time::Instant::now();
+                    return Some(entry.value.clone());
+                } else {
+                    guard.remove(call_id);
+                    return None;
+                }
+            }
+            return None;
+        }
+
         if let Ok(guard) = cache.try_read() {
-            return guard.get(call_id).cloned();
+            if let Some(entry) = guard.get(call_id) {
+                if entry.last_accessed.elapsed() < TOOL_CALL_CACHE_TTL {
+                    return Some(entry.value.clone());
+                }
+            }
         }
     }
 
@@ -5696,7 +5723,54 @@ pub fn insert_cached_tool_call(call_id: String, item: Value) {
     let cache = WEBSOCKET_TOOL_CALL_CACHE.get_or_init(|| TokioRwLock::new(HashMap::new()));
 
     if let Ok(mut guard) = cache.try_write() {
-        guard.insert(call_id, item);
+        let now = std::time::Instant::now();
+
+        // 1. 若容量达到 TOOL_CALL_CACHE_CAP，先清理已过期的项
+        if guard.len() >= TOOL_CALL_CACHE_CAP {
+            guard.retain(|_, entry| entry.last_accessed.elapsed() < TOOL_CALL_CACHE_TTL);
+        }
+
+        // 2. 若容量仍然达到上限（且非覆盖已有键），按真 LRU 驱逐最久未使用的项
+        if !guard.contains_key(&call_id) {
+            while guard.len() >= TOOL_CALL_CACHE_CAP {
+                if let Some(oldest_key) = guard
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_accessed)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest_key);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 3. 写入新项或覆盖更新
+        guard.insert(
+            call_id,
+            ToolCallCacheEntry {
+                value: item,
+                last_accessed: now,
+            },
+        );
+    }
+}
+
+pub fn remove_cached_tool_call(call_id: &str) -> Option<Value> {
+    if let Some(cache) = WEBSOCKET_TOOL_CALL_CACHE.get() {
+        if let Ok(mut guard) = cache.try_write() {
+            return guard.remove(call_id).map(|entry| entry.value);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub fn clear_cached_tool_calls_for_test() {
+    if let Some(cache) = WEBSOCKET_TOOL_CALL_CACHE.get() {
+        if let Ok(mut guard) = cache.try_write() {
+            guard.clear();
+        }
     }
 }
 
@@ -7158,4 +7232,70 @@ async fn try_compress_openai_with_summary(
     let mut forked_request = original_request.clone();
     forked_request.messages = forked_messages;
     Ok(forked_request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_tool_call_cache() {
+        clear_cached_tool_calls_for_test();
+
+        // 1. 正常读写
+        let call_id = "test_call_normal".to_string();
+        let val = json!({ "name": "get_weather", "arguments": "{\"location\": \"Beijing\"}" });
+        insert_cached_tool_call(call_id.clone(), val.clone());
+        assert_eq!(get_cached_tool_call(&call_id), Some(val.clone()));
+
+        // 2. remove_cached_tool_call 正常移除
+        let removed = remove_cached_tool_call(&call_id);
+        assert_eq!(removed, Some(val));
+        assert_eq!(get_cached_tool_call(&call_id), None);
+        assert_eq!(remove_cached_tool_call(&call_id), None);
+
+        // 3. 超出容量触发淘汰（真 LRU 驱逐与容量上限）
+        clear_cached_tool_calls_for_test();
+
+        // 先插入 call_to_evict，并休眠确保其 last_accessed 严格早于后续项
+        insert_cached_tool_call("call_to_evict".to_string(), json!({ "index": "evict" }));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 再插入 call_to_refresh，后续通过读取刷新访问时间
+        insert_cached_tool_call(
+            "call_to_refresh".to_string(),
+            json!({ "index": "refresh" }),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填充至 TOOL_CALL_CACHE_CAP (还需插入 TOOL_CALL_CACHE_CAP - 2 项)
+        for i in 0..(TOOL_CALL_CACHE_CAP - 2) {
+            insert_cached_tool_call(format!("call_fill_{}", i), json!({ "index": i }));
+        }
+
+        // 此时缓存已满 TOOL_CALL_CACHE_CAP 项
+        // 读取 call_to_refresh，使其 last_accessed 被更新为最新时间
+        assert!(get_cached_tool_call("call_to_refresh").is_some());
+
+        // 插入超出容量的新项 call_new
+        insert_cached_tool_call("call_new".to_string(), json!({ "index": "new" }));
+
+        // 验证容量保持在 TOOL_CALL_CACHE_CAP
+        if let Some(cache) = WEBSOCKET_TOOL_CALL_CACHE.get() {
+            if let Ok(guard) = cache.try_read() {
+                assert_eq!(guard.len(), TOOL_CALL_CACHE_CAP);
+            }
+        }
+
+        // 验证 call_to_refresh 依然存在（因为被读取刷新了活跃时间）
+        assert!(get_cached_tool_call("call_to_refresh").is_some());
+        // 验证 call_to_evict 被淘汰（因为它是最久未被访问的项）
+        assert!(get_cached_tool_call("call_to_evict").is_none());
+        // 验证 call_new 成功插入
+        assert!(get_cached_tool_call("call_new").is_some());
+
+        // 清理测试残留
+        clear_cached_tool_calls_for_test();
+    }
 }
