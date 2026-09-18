@@ -5,7 +5,8 @@ use rquest::Client;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 
 use rquest_util::Emulation;
 use std::sync::OnceLock;
@@ -20,8 +21,28 @@ pub fn get_global_proxy_pool() -> Option<Arc<ProxyPoolManager>> {
 
 /// 初始化全局代理池管理器
 pub fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<ProxyPoolManager> {
-    let manager = Arc::new(ProxyPoolManager::new(config));
-    let _ = GLOBAL_PROXY_POOL.set(manager.clone());
+    if let Some(existing) = GLOBAL_PROXY_POOL.get() {
+        let pool_to_update = existing.clone();
+        tokio::spawn(async move {
+            let new_cfg = config.read().await.clone();
+            *pool_to_update.config.write().await = new_cfg;
+            pool_to_update.sync_bindings_from_config().await;
+        });
+        return existing.clone();
+    }
+
+    let manager = Arc::new(ProxyPoolManager::new(config.clone()));
+    if let Err(_) = GLOBAL_PROXY_POOL.set(manager.clone()) {
+        if let Some(existing) = GLOBAL_PROXY_POOL.get() {
+            let pool_to_update = existing.clone();
+            tokio::spawn(async move {
+                let new_cfg = config.read().await.clone();
+                *pool_to_update.config.write().await = new_cfg;
+                pool_to_update.sync_bindings_from_config().await;
+            });
+            return existing.clone();
+        }
+    }
     manager
 }
 
@@ -45,6 +66,19 @@ pub struct ProxyPoolManager {
 
     /// 轮询索引 (用于 RoundRobin 策略)
     round_robin_index: Arc<AtomicUsize>,
+
+    /// 健康检查后台协程句柄
+    health_check_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+impl Drop for ProxyPoolManager {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.health_check_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 impl ProxyPoolManager {
@@ -71,6 +105,7 @@ impl ProxyPoolManager {
             usage_counter: Arc::new(DashMap::new()),
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
+            health_check_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -625,22 +660,30 @@ impl ProxyPoolManager {
         }
     }
 
-    /// 启动健康检查循环
-    pub fn start_health_check_loop(self: Arc<Self>) {
+    fn spawn_health_check_task(weak_self: std::sync::Weak<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("Starting proxy pool health check loop...");
             loop {
+                // 弱引用化：每次循环开始时 weak_self.upgrade()，若为 None 说明 manager 已释放，直接 break 退出循环
+                let manager = match weak_self.upgrade() {
+                    Some(m) => m,
+                    None => {
+                        tracing::info!("[ProxyPool] ProxyPoolManager dropped, exiting health check loop");
+                        break;
+                    }
+                };
+
                 // Perform check only if enabled
-                let enabled = self.config.read().await.enabled;
+                let enabled = manager.config.read().await.enabled;
                 if enabled {
-                    if let Err(e) = self.health_check().await {
+                    if let Err(e) = manager.health_check().await {
                         tracing::error!("Proxy pool health check failed: {}", e);
                     }
                 }
 
                 // Get interval and sleep AFTER check
                 let interval_secs = {
-                    let cfg = self.config.read().await;
+                    let cfg = manager.config.read().await;
                     if !cfg.enabled {
                         60 // check every minute if disabled
                     } else {
@@ -648,9 +691,43 @@ impl ProxyPoolManager {
                     }
                 };
 
+                // 在 sleep 期间 drop 掉强引用，打破 Arc 循环引用
+                drop(manager);
+
                 tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             }
-        });
+        })
+    }
+
+    /// 启动健康检查循环
+    pub fn start_health_check_loop(self: Arc<Self>) {
+        if let Ok(mut guard) = self.health_check_handle.try_lock() {
+            if let Some(old_handle) = guard.take() {
+                old_handle.abort();
+            }
+            let handle = Self::spawn_health_check_task(Arc::downgrade(&self));
+            *guard = Some(handle);
+        } else {
+            let handle_lock = self.health_check_handle.clone();
+            let weak_self = Arc::downgrade(&self);
+            tokio::spawn(async move {
+                let mut guard = handle_lock.lock().await;
+                if let Some(old_handle) = guard.take() {
+                    old_handle.abort();
+                }
+                let handle = Self::spawn_health_check_task(weak_self);
+                *guard = Some(handle);
+            });
+        }
+    }
+
+    /// 停止健康检查循环
+    pub async fn stop_health_check_loop(&self) {
+        let mut guard = self.health_check_handle.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort();
+            tracing::info!("[ProxyPool] Stopped proxy pool health check loop");
+        }
     }
 }
 
@@ -732,6 +809,118 @@ mod tests {
         let res = pool.build_proxy_config(&entry);
         assert!(res.is_ok());
         assert_eq!(res.unwrap().entry_id, "p3");
+    }
+
+    #[tokio::test]
+    async fn test_start_health_check_loop_multiple_calls_no_leak() {
+        let config = Arc::new(RwLock::new(ProxyPoolConfig::default()));
+        let manager = Arc::new(ProxyPoolManager::new(config));
+
+        // 第一次启动
+        manager.clone().start_health_check_loop();
+        let abort_handle_1 = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+        assert!(!abort_handle_1.is_finished());
+
+        // 第二次启动：应该中止第一次的协程
+        manager.clone().start_health_check_loop();
+        let abort_handle_2 = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+
+        // 等待一小段时间让旧协程处理中止信号
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 验证旧任务已被中止
+        assert!(abort_handle_1.is_finished());
+        // 验证新任务仍在运行
+        assert!(!abort_handle_2.is_finished());
+
+        // 清理停止
+        manager.stop_health_check_loop().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(abort_handle_2.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_stop_health_check_loop() {
+        let config = Arc::new(RwLock::new(ProxyPoolConfig::default()));
+        let manager = Arc::new(ProxyPoolManager::new(config));
+
+        manager.clone().start_health_check_loop();
+        let abort_handle = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+        assert!(!abort_handle.is_finished());
+
+        // 主动停止
+        manager.stop_health_check_loop().await;
+
+        // 句柄应被置为 None
+        assert!(manager.health_check_handle.lock().await.is_none());
+
+        // 任务应该已被中止
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(abort_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_manager_drop_terminates_health_check_loop() {
+        let config = Arc::new(RwLock::new(ProxyPoolConfig::default()));
+        let manager = Arc::new(ProxyPoolManager::new(config));
+        let weak_manager = Arc::downgrade(&manager);
+
+        manager.clone().start_health_check_loop();
+        let abort_handle = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+        assert!(!abort_handle.is_finished());
+
+        // Drop 掉 manager 强引用，验证后台任务因为使用弱引用且 Drop 中止任务而正确释放
+        drop(manager);
+
+        // 强引用计数归零，弱引用无法 upgrade，证明没有循环引用泄漏
+        assert!(weak_manager.upgrade().is_none());
+
+        // 协程应该正确终止
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(abort_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_init_global_proxy_pool_reuse_and_update_config() {
+        let mut initial_config = ProxyPoolConfig::default();
+        initial_config.enabled = false;
+        let config_1 = Arc::new(RwLock::new(initial_config));
+
+        let pool_1 = init_global_proxy_pool(config_1);
+
+        let mut updated_config = ProxyPoolConfig::default();
+        updated_config.enabled = true;
+        updated_config.health_check_interval = 42;
+        let config_2 = Arc::new(RwLock::new(updated_config));
+
+        // 第二次初始化同一个全局代理池
+        let pool_2 = init_global_proxy_pool(config_2);
+
+        // 应该返回同一个实例，不创建孤儿对象
+        assert!(Arc::ptr_eq(&pool_1, &pool_2));
+
+        // 等待异步更新配置完成
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let current_cfg = pool_1.config.read().await;
+        assert_eq!(current_cfg.enabled, true);
+        assert_eq!(current_cfg.health_check_interval, 42);
     }
 }
 
