@@ -4,6 +4,19 @@ use crate::proxy::model_specs;
 use crate::proxy::token_manager::ProxyToken;
 
 use serde_json::{json, Value};
+use std::borrow::Cow;
+
+const HERMES_AGENT_IDENTITY_PREFIX: &str =
+    "You are Hermes Agent, an intelligent AI assistant created by Nous Research.";
+const ANTIGRAVITY_AGENT_IDENTITY: &str =
+    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
+
+fn normalize_openai_client_identity(text: &str) -> Cow<'_, str> {
+    match text.strip_prefix(HERMES_AGENT_IDENTITY_PREFIX) {
+        Some(remainder) => Cow::Owned(format!("{ANTIGRAVITY_AGENT_IDENTITY}{remainder}")),
+        None => Cow::Borrowed(text),
+    }
+}
 
 pub(crate) fn is_tiered_flash_model(model: &str) -> bool {
     let model_id = model
@@ -302,8 +315,8 @@ pub fn transform_openai_request_with_session(
     let user_thinking_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
 
     let is_claude_model = mapped_model_lower.contains("claude");
-    let is_claude_thinking = mapped_model_lower.ends_with("-thinking")
-        || (is_claude_model && user_enabled_thinking);
+    let is_claude_thinking =
+        mapped_model_lower.ends_with("-thinking") || (is_claude_model && user_enabled_thinking);
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
@@ -393,6 +406,8 @@ pub fn transform_openai_request_with_session(
     system_instructions = system_instructions
         .into_iter()
         .map(|s| {
+            // Replace the exact Hermes prefix before cache lookup and sanitization.
+            let s = normalize_openai_client_identity(&s);
             let raw_key = crate::proxy::cache_manager::CacheManager::compute_si_key(&s);
             if let Some(cached) = cm.lookup_si(&raw_key) {
                 si_layer_stats.0 += 1;
@@ -865,7 +880,12 @@ pub fn transform_openai_request_with_session(
             "role": "user",
             "parts": [{ "text": "Continue" }]
         }));
-    } else if contents.first().and_then(|f| f.get("role")).and_then(|r| r.as_str()) == Some("model") {
+    } else if contents
+        .first()
+        .and_then(|f| f.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("model")
+    {
         contents.insert(
             0,
             json!({
@@ -1523,6 +1543,210 @@ fn enforce_uppercase_types(value: &mut Value) {
 mod tests {
     use super::*;
     use crate::proxy::mappers::openai::models::*;
+
+    #[test]
+    fn hermes_identity_prefix_is_normalized_without_losing_remainder() {
+        let remainder = "\n\nKeep every Hermes capability and tool instruction.";
+        let input = format!("{HERMES_AGENT_IDENTITY_PREFIX}{remainder}");
+
+        let normalized = normalize_openai_client_identity(&input);
+
+        assert!(normalized.starts_with(ANTIGRAVITY_AGENT_IDENTITY));
+        assert!(normalized.ends_with(remainder));
+        assert!(!normalized.contains(HERMES_AGENT_IDENTITY_PREFIX));
+    }
+
+    #[test]
+    fn hermes_identity_mention_is_not_rewritten() {
+        let input = format!("Compatibility note: {HERMES_AGENT_IDENTITY_PREFIX}");
+
+        assert_eq!(normalize_openai_client_identity(&input), input);
+    }
+
+    #[test]
+    fn unrelated_identity_is_borrowed_unchanged() {
+        let input = "You are a helpful assistant.";
+
+        assert!(matches!(
+            normalize_openai_client_identity(input),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn hermes_identity_matching_is_exact_and_preserves_arbitrary_suffix() {
+        for input in [
+            String::new(),
+            format!(" {HERMES_AGENT_IDENTITY_PREFIX}"),
+            format!("\n{HERMES_AGENT_IDENTITY_PREFIX}"),
+            HERMES_AGENT_IDENTITY_PREFIX.to_lowercase(),
+            HERMES_AGENT_IDENTITY_PREFIX
+                .trim_end_matches('.')
+                .to_owned(),
+            format!("Quoted: {HERMES_AGENT_IDENTITY_PREFIX}"),
+        ] {
+            assert!(matches!(
+                normalize_openai_client_identity(&input),
+                Cow::Borrowed(_)
+            ));
+            assert_eq!(normalize_openai_client_identity(&input), input);
+        }
+        for suffix in ["", "\r\n\r\n中文\t  \n\n\n", HERMES_AGENT_IDENTITY_PREFIX] {
+            let input = format!("{HERMES_AGENT_IDENTITY_PREFIX}{suffix}");
+            let normalized = normalize_openai_client_identity(&input);
+            assert_eq!(normalized, format!("{ANTIGRAVITY_AGENT_IDENTITY}{suffix}"));
+            assert_eq!(normalize_openai_client_identity(&normalized), normalized);
+        }
+    }
+
+    #[test]
+    fn hermes_protocol_forms_preserve_request_and_prefix_hash() {
+        let tools: Vec<Value> = (0..20).map(|i| json!({
+            "type": "function",
+            "function": {
+                "name": format!("session_search_{i}"),
+                "description": "Search synthetic sessions",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+            }
+        })).collect();
+        let remainder = format!(
+            "\n\n{}",
+            "Keep Hermes tools and instructions.\n".repeat(900)
+        );
+        for form in ["system", "developer", "blocks", "instructions"] {
+            let mut raw = json!({
+                "model": "gemini-3.8-flash-high",
+                "messages": [
+                    {"role": "user", "content": HERMES_AGENT_IDENTITY_PREFIX},
+                    {"role": "assistant", "content": HERMES_AGENT_IDENTITY_PREFIX},
+                    {"role": "user", "content": "hello"}
+                ],
+                "tools": tools,
+                "tool_choice": "auto",
+                "temperature": 0.3
+            });
+            let prompt = format!("{HERMES_AGENT_IDENTITY_PREFIX}{remainder}");
+            if form == "instructions" {
+                raw["instructions"] = json!(prompt);
+            } else {
+                let content = if form == "blocks" {
+                    json!([{"type": "text", "text": prompt}])
+                } else {
+                    json!(prompt)
+                };
+                raw["messages"].as_array_mut().unwrap().insert(
+                    0,
+                    json!({
+                        "role": if form == "blocks" { "system" } else { form }, "content": content
+                    }),
+                );
+            }
+            let request: OpenAIRequest = serde_json::from_value(raw.clone()).unwrap();
+            let (first, _, _, hash) =
+                transform_openai_request(&request, "test-project", "gemini-3.8-flash-high", None);
+            let (second, _, _, second_hash) =
+                transform_openai_request(&request, "test-project", "gemini-3.8-flash-high", None);
+            assert_eq!(hash, second_hash, "{form}");
+            assert_eq!(first["request"], second["request"], "{form}");
+            assert_eq!(
+                first["request"]["tools"][0]["functionDeclarations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                20
+            );
+            let normalized = json!(format!("{ANTIGRAVITY_AGENT_IDENTITY}{remainder}"));
+            match form {
+                "instructions" => raw["instructions"] = normalized,
+                "blocks" => raw["messages"][0]["content"][0]["text"] = normalized,
+                _ => raw["messages"][0]["content"] = normalized,
+            }
+            let expected: OpenAIRequest = serde_json::from_value(raw).unwrap();
+            let (expected, _, _, expected_hash) =
+                transform_openai_request(&expected, "test-project", "gemini-3.8-flash-high", None);
+            assert_eq!(first["request"], expected["request"], "{form}");
+            assert_eq!(hash, expected_hash, "{form}");
+            let contents = first["request"]["contents"].to_string();
+            assert_eq!(contents.matches(HERMES_AGENT_IDENTITY_PREFIX).count(), 2);
+        }
+    }
+
+    #[test]
+    fn transform_normalizes_hermes_identity_and_preserves_tools() {
+        let remainder = "\n\nHermes-specific instructions remain intact.";
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": format!("{HERMES_AGENT_IDENTITY_PREFIX}{remainder}")
+                },
+                {"role": "user", "content": "hello"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "session_search",
+                    "description": "Search sessions",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        }))
+        .unwrap();
+
+        let (body, _, _, _) =
+            transform_openai_request(&request, "test-project", "gemini-3.8-flash-high", None);
+        let system = body["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+
+        assert!(system.contains(ANTIGRAVITY_AGENT_IDENTITY));
+        assert!(system.contains("Hermes-specific instructions remain intact."));
+        assert!(!system.contains(HERMES_AGENT_IDENTITY_PREFIX));
+        assert_eq!(
+            body["request"]["tools"][0]["functionDeclarations"][0]["name"],
+            "session_search"
+        );
+    }
+
+    #[test]
+    fn responses_hermes_instructions_reach_shared_normalizer() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-high",
+            "instructions": format!("{HERMES_AGENT_IDENTITY_PREFIX}\n\nKeep Hermes rules."),
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "session_search",
+                    "description": "Search sessions",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        }))
+        .unwrap();
+        let (body, _, _, _) =
+            transform_openai_request(&request, "test-project", "gemini-3.8-flash-high", None);
+        let system = body["request"]["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+
+        assert!(system.contains(ANTIGRAVITY_AGENT_IDENTITY));
+        assert!(system.contains("Keep Hermes rules."));
+    }
+
+    #[test]
+    fn normalized_hermes_prompt_is_byte_stable() {
+        let prompt = format!("{HERMES_AGENT_IDENTITY_PREFIX}\n\nStable Hermes rules.");
+        let first = normalize_openai_client_identity(&prompt).into_owned();
+        let second = normalize_openai_client_identity(&prompt).into_owned();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            crate::proxy::cache_manager::CacheManager::compute_si_key(&first),
+            crate::proxy::cache_manager::CacheManager::compute_si_key(&second)
+        );
+    }
 
     fn tiered_request_body(model: &str, effort: Option<&str>) -> Value {
         let mut raw = json!({

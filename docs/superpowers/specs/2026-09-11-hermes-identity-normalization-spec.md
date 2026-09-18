@@ -1,90 +1,86 @@
-# Hermes 身份归一化规格
+# Hermes 身份归一化与统一 Docker 交付 Spec
 
-## 开发目标
+**更新日期：** 2026-09-12
+**基线：** 官方上游 734e2bd / 4.7.1，加当前本地身份及 Docker 补丁。
+**状态：** 用于合并后验证与生产闭环，不声明当前 429 已解决。
 
-在 `Antigravity-Manager` 的 OpenAI 请求转换层识别 Hermes 官方 system prompt，并将其身份前缀替换为 Google Antigravity 支持的官方身份。除身份前缀外，Hermes 的系统指令、工具定义、消息历史和请求参数必须完整保留。
+## 1. 目标和范围
 
-## 术语
+在共享 OpenAI 转换层精确替换 Hermes 官方身份，保留后缀及原有提示、工具、历史和缓存转换语义。支持 Chat Completions、Responses 流式/非流式调用，交付单个提供 Web UI 与 API 的 Docker 镜像。
 
-- **Hermes Identity Prefix**：`You are Hermes Agent, an intelligent AI assistant created by Nous Research.`
-- **Antigravity Identity**：OpenAI mapper 当前使用的 `fallback_antigravity_identity` 第一行身份。
-- **Normalization**：只替换 system/developer instruction 开头的 Hermes Identity Prefix。
-- **User Text**：role 为 user、assistant 或 tool 的内容，永不参与身份归一化。
+本功能不承诺绕过真实 RPM/TPM、日配额或容量限制，不修改 Hermes 源码，不增加身份配置开关。保留上游 4.7.1 的配额刷新、限流分类、动态 requestType、会话隔离和工具参数行为；额外 bug 必须先复现再单独处理。
 
-## 功能需求
+## 2. 精确替换契约
 
-### FR-1 识别规范 Hermes 身份
+Hermes 完整前缀：
 
-当一个 OpenAI system 或 developer instruction 以完整 Hermes Identity Prefix 开头时，系统必须识别为 Hermes 客户端身份。
+    You are Hermes Agent, an intelligent AI assistant created by Nous Research.
 
-不得匹配：
+替换身份：
 
-- 中间或末尾提及 Hermes Identity Prefix 的文本。
-- `Hermes Agent` 的模糊子串。
-- 大小写不同、拼写不同或缺少完整句号的文本。
-- user/assistant/tool 消息中的相同文本。
+    You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
 
-### FR-2 替换而非追加
+- 仅匹配单条已收集 instruction 字节零位置的完整前缀，区分大小写和句号。
+- 不 trim，不做子串或模糊匹配。前导空白/BOM、中间引用、近似拼写不命中。
+- 输出严格等于“替换身份 + 原后缀”。Unicode、CRLF、空行及后缀再次出现 Hermes 句子均逐字保留。
+- 未命中返回 Cow::Borrowed，不为身份判断分配新 String。已归一化文本再次执行结果不变。
+- 作用域仅为 system/developer 收集结果与 Responses instructions。user/assistant/tool 不参与身份归一化。
+- 文本块先按既有规则连接，再判断完整 instruction；不对每个块独立做替换。
 
-系统必须删除且仅删除开头的 Hermes Identity Prefix，并在相同位置放入 Antigravity Identity。
+## 3. 共享入口和缓存
 
-不能仅在前面追加，因为实测同时存在两个身份仍返回 429。
+唯一接入点为 transform_openai_request_with_session() 中 L1 cache map：
 
-### FR-3 保留剩余内容
+    收集 instructions → normalize_openai_client_identity
+    → compute_si_key → lookup_si / sanitize → dedupe
+    → context_blocks / tools → compute_prefix_hash
 
-替换后：
+覆盖 /v1/chat/completions、/v1/responses、/responses 的实际 handler 路径，不在 HTTP handler 复制身份逻辑。禁止为该补丁清空缓存、注入随机内容或改变会话绑定。
 
-- 原身份后的所有字符逐字保留，包括换行。
-- 所有其他 system/developer instruction 顺序不变。
-- tools、tool choice、thinking config、history、media 和 user message 不变。
+相同请求的 normalized text、SI key、systemInstruction、tools 与实际 prefix hash 应相同。随机 requestId 不属于稳定性断言；会话代数改变也不能误判为身份缓存不稳定。
 
-### FR-4 共享覆盖两个 OpenAI 入口
+## 4. 内容兼容与上游行为
 
-归一化必须位于 `transform_openai_request_with_session()` 的共享 system instruction 收集路径，使以下入口自动覆盖：
+身份函数逐字保留后缀；完整 mapper 继续运行动态清洗、分段和工具 schema 规范化。以“同一请求只手动替换前缀后经过相同 mapper”为 oracle，比较 systemInstruction、tools、toolConfig、generationConfig 和 contents；排除原本随机的外层 requestId。
 
-- `/v1/chat/completions`
-- `/v1/responses`
-- `/responses`
+至少覆盖 20 个合成工具的名称、参数、描述，覆盖 tool_choice、thinking、媒体、工具返回和多轮历史。非 Hermes 请求与未增加身份补丁的基线一致，不能承诺最终输出与原始 OpenAI 文本逐字相同。
 
-不得在 HTTP handler 中复制三份判断。
+必须保留上游新语义：
 
-### FR-5 缓存稳定
+- 纯文本且无工具交互时，不强制注入 agent requestType。
+- tools 或工具历史存在时，保留 agent 标记行为。
+- sessionId 遵循账号、对话指纹及代数隔离。
+- 通用 RESOURCE_EXHAUSTED、显式 QUOTA_EXHAUSTED、RATE_LIMIT_EXCEEDED、MODEL_CAPACITY_EXHAUSTED 按实际分类与重试链路验证；只验证 helper 不足以证明整体行为。
 
-归一化必须发生在 `CacheManager::compute_si_key()` 和 `sanitize_system_instruction_for_cache()` 之前。相同 Hermes prompt 每次必须产生字节相同的 normalized system instruction 和 prefix hash。
+## 5. 验收矩阵
 
-### FR-6 非 Hermes 请求无变化
+| 层级 | 覆盖 | 通过条件 |
+|---|---|---|
+| 纯函数 | 完整前缀、空后缀、Unicode/CRLF、后缀引用、近似文本、BOM/空白、幂等 | 严格字节等式，未命中借用 |
+| mapper | system、developer、文本块、独立 instructions | 与手工归一化 oracle 一致，user/assistant/tool 未改写 |
+| 内容与缓存 | 20 tools、tool_choice/thinking、媒体/历史、重复转换 | 语义保留，SI key 与实际 prefix hash 稳定 |
+| HTTP handler | Chat、两条 Responses 路由；stream true/false | mock 上游捕获身份正确，响应/SSE 与工具往返正常 |
+| 上游回归 | requestType、会话、限流分类与重试 | 保留 4.7.1 基线行为，无身份补丁引入的偏差 |
+| 统一容器 | Linux 二进制、HTML、JS、health | 单镜像正常启动，静态资源与本次前端构建一致 |
+| 生产 | 合成对照矩阵、完整 Hermes tools、两轮上下文 | 合理配额/容量条件下两协议成功，失败有可解释证据 |
 
-所有未匹配 Hermes Identity Prefix 的 String 必须原值返回，不分配新的 String；可使用 `Cow<'_, str>` 达成。
+中间引用必须保留，但不要求其真实上游必然返回 200。模拟配额耗尽检查错误传播，不为验收故意耗尽生产账号。
 
-## 安全要求
+## 6. Docker 交付
 
-- 不记录完整 system prompt。
-- 不在日志中输出 user content、API key、账号邮箱或 token。
-- 测试只使用合成提示，不使用生产 request dump。
-- 匹配必须精确且仅限 system/developer 层。
+- 默认用 docker/Dockerfile 构建当前前端和当前后端；最终镜像包含 /app/dist 与 /app/antigravity-tools，使用 --headless。
+- backend.localdist 可复用本次源码重新编译的 dist。backend 复用旧镜像前端仅适用于已验证兼容的场景，不能作为完整前后端更新默认方式。
+- Cargo 二进制名为 antigravity-tools；当前 Rust 基础镜像 CARGO_HOME=/usr/local/cargo，镜像源与缓存路径须一致。
+- 镜像标签包含版本及构建标识；记录源码 SHA、未提交修改状态、image ID、平台、归档 SHA-256 与测试证据。
+- 合并后版本为 4.7.1；旧 hermes-20260912 / 4.6.9 镜像不是新交付。版本号不能替代 image ID 核验。
+- 沿用原 Compose 文件、项目名、网络、密钥及数据挂载。默认配置为 host 网络、ABV_BIND_LOCAL_ONLY=true；不能把示例 API_KEY=test 带入生产。
+- 保留上游日志轮转。更新前保存旧镜像、配置和一致数据备份；更新后验证 health 与页面资源，失败可切回旧镜像。
+- 外挂 /app/dist 会遮住镜像前端，更新前必须核查。镜像归档支持 docker load，目标机不需要 Rust/Node。
 
-## 兼容性要求
+## 7. 安全和完成条件
 
-- 不改变 Claude mapper 的 `normalize_claude_client_identity()`。
-- 不改变 model mapping、quota tracker、sticky session 或重试逻辑。
-- 不新增配置项或环境变量。
-- 不改变 API response schema。
-- 不影响 Windows、Linux、macOS；实现只使用 Rust stdlib。
+诊断只记录协议、模型、命中数量、长度、摘要、匿名账号、错误 reason 和等待时间。不得新增完整提示、API key、token 或历史消息日志；需要留存的原始错误须脱敏。
 
-## 验收标准
+所有层级验收完成且用户生产反馈闭环后才能标记问题解决。当前旧 4.6.9 的 8 项 Hermes 测试与容器验证只作历史证据；4.7.1 合并后的测试、镜像重建与生产矩阵均待执行。
 
-1. GIVEN 以 Hermes Identity Prefix 开头的 system instruction, WHEN 转换请求, THEN 输出必须以 Antigravity Identity 开头且不再包含原 Hermes identity prefix。
-2. GIVEN Hermes Identity Prefix 后存在任意后续指令, WHEN 转换请求, THEN 后续指令必须逐字保留。
-3. GIVEN 文本只是在中间引用 Hermes Identity Prefix, WHEN 转换请求, THEN 输出必须原样不变。
-4. GIVEN user 消息包含 Hermes Identity Prefix, WHEN 转换请求, THEN user 消息必须原样不变。
-5. GIVEN 完整 Hermes system + tools, WHEN 分别调用 chat 和 Responses 转换路径, THEN 两条路径都必须包含 normalized identity 和全部 tools。
-6. GIVEN 相同 Hermes prompt 转换两次, WHEN 计算 prefix hash, THEN 两次 hash 必须相等。
-7. GIVEN 生产端两个账号配额可用, WHEN 发送完整 Hermes request, THEN Manager 必须返回 200，不得返回身份分类导致的 RESOURCE_EXHAUSTED。
-
-## 非目标
-
-- 解决真实 Google TPM、RPM 或日配额耗尽。
-- 增加账号数量或改变轮询算法。
-- 修改 Hermes prompt 内容和工具数量。
-- 为任意第三方 Agent 名称做通用伪装。
-- 将客户端身份做成用户配置。
+参考：[报告](../reviews/2026-09-11-hermes-identity-investigation.md)、[计划](../plans/2026-09-11-hermes-identity-normalization-plan.md)。

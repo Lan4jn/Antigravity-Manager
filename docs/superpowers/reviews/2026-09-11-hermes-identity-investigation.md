@@ -1,162 +1,96 @@
-# Hermes 请求 429/503 完整排查报告
+# Hermes 身份归一化与 429/503 排查报告
 
-**日期：** 2026-09-11
+**更新日期：** 2026-09-12（保留原文件名及链接）
+**状态：** 身份补丁已实现；用户更新容器后仍报告 429，生产故障尚未闭环。
+**基线：** 官方上游 734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e / 4.7.1；当前合并提交 1ae1fa5，另含本地未提交的 Hermes/Docker 修改。
 
-**项目：** `Antigravity-Manager`
+## 1. 当前结论
 
-**检查版本：** `4.6.9`，仓库 HEAD `3d42ac0`
+2026-09-11 的对照实验支持：规范 Hermes 身份是当时失败请求的一个触发因素，精确替换它曾让完整提示及工具请求返回 200。这不能证明 Google 内部分类规则，也不能证明所有 RESOURCE_EXHAUSTED 均由身份导致。
 
-## 结论
+2026-09-12 用户确认更新容器后仍收到 All accounts exhausted，末次上游错误为 HTTP 429、RESOURCE_EXHAUSTED。尚未取得该次部署的镜像 ID、转换结果、错误详情和实时配额，不能宣称生产故障已修复，也不能仅凭该错误断言日配额耗尽。
 
-根因在 `Antigravity-Manager` 的 OpenAI 请求转换层，不在 Hermes。
+## 2. 上游同步记录
 
-Google Antigravity 上游会依据 system instruction 的 Agent 身份文本分类请求。Manager 已对 Claude Agent SDK 身份做归一化，但 OpenAI mapper 没有处理 Hermes 的规范身份前缀：
+- fork origin：https://github.com/Lan4jn/Antigravity-Manager.git，main 仍为 3d42ac0。
+- 官方 upstream：https://github.com/lbjlaq/Antigravity-Manager.git，main 为 734e2bd。
+- 直连 fetch 失败后，通过下载代理获取 Git 对象，与 GitHub 官方 API 返回的完整 SHA 核对一致后合并。
+- 已合入 codex/hermes-identity-normalization 分支，未推送远端，也未重置本地 main。
+- 合并前修改已通过命名 stash 备份并无冲突恢复；备份名包含 before upstream 734e2bd sync。
 
-```text
-You are Hermes Agent, an intelligent AI assistant created by Nous Research.
-```
-
-该身份原样发送给上游时，两个配额均为 96% 的有效账号都收到 `RESOURCE_EXHAUSTED`，Manager 最终返回：
-
-```text
-429 All accounts exhausted
-503 Token error: All accounts limited
-```
-
-仅将上述规范前缀替换为 Antigravity 官方身份，保留其余 29KB Hermes 系统提示和 20 个工具定义后，请求返回 `200`，模型正常产生 `session_search` 工具调用。
-
-## 用户症状
-
-Hermes QQBot 返回：
-
-```text
-The model provider failed after retries. I kept raw provider details out of chat;
-check gateway logs for diagnostics.
-```
-
-130 Gateway 日志显示：
-
-```text
-provider=custom
-base_url=http://server.model.dpdns.org:8045/v1
-model=gemini-3.8-flash-high
-HTTP 429: All accounts exhausted
-HTTP 503: Token error: All accounts limited. Wait 20-29s
-```
-
-## 环境核对
-
-- Manager `/health`：`4.6.9`。
-- Manager active accounts：2。
-- 两个账号：enabled，未 validation block，未 quota protection。
-- 两个账号的 `gemini-3.8-flash-high` 配额：96%。
-- 调度模式：`Balance`，最大等待 60 秒。
-- Hermes 模型名：`gemini-3.8-flash-high`，无终端转义字符。
-- Hermes 与 curl 使用的 API key SHA-256 相同。
-- `/v1/models` 返回 200，目标模型存在。
-
-## 排除项
-
-### 不是模型不存在
-
-`/v1/models` 返回 94 个模型，包含 `gemini-3.8-flash-high`。
-
-### 不是 API key 错误
-
-Hermes 配置密钥和 custom provider `key_env` 密钥哈希相同；简短请求返回 200。
-
-### 不是 Responses API 独有问题
-
-`/v1/responses` 会失败；切换 `/v1/chat/completions` 后，Hermes 完整请求仍失败。
-
-### 不是 stream 参数
-
-简短的 `stream=false` 和 `stream=true` 请求均返回 200。
-
-### 不是 tools 字段
-
-约 60KB、包含完整 20 个 Hermes tools 的简短请求返回 200；完整 Hermes system prompt 在无 tools 时仍返回 429。
-
-### 不是真实日配额耗尽
-
-两个账号目标模型配额均为 96%。清除 Manager 本地限流后，Hermes 身份请求立即复现 429。
-
-### 不是 sticky session 永久损坏
-
-相同首条 user 文本 `hello` 的简短请求返回 200；加入 Hermes 身份后返回 429。
-
-## 决定性实验矩阵
-
-每组身份实验前调用 Manager 自带接口清除本地限流，避免前一请求污染后一请求：
-
-```text
-DELETE /api/proxy/rate-limits -> 200
-```
-
-| 请求 | 结果 |
+| 官方更新 | 对排查的影响 |
 |---|---|
-| 中性 system：`You are a helpful assistant.` | 200 |
-| 仅 Hermes 规范身份 | 429 |
+| a620ec2：配额多端点回退、project_id 缓存、bucket 合并 | 面板百分比不能单独证明实际可用性，需要刷新并取证 |
+| 734e2bd：细分 429 | 部分分类路径区分通用资源耗尽、显式 quota/reset 与 model capacity |
+| 734e2bd：动态 requestType | 纯文本不再统一标记 agent；带 tools 或工具历史才标记 agent，旧矩阵需重跑 |
+| 734e2bd：会话隔离、超长会话恢复 | sessionId 混入对话指纹和代数，不再只是每账号固定会话 |
+| 工具参数修复、Compose 日志轮转 | 保留上游行为，身份补丁不能覆盖这些更新 |
+
+注意：handlers/common.rs 的 determine_retry_strategy() 仍包含 RESOURCE_EXHAUSTED 快速轮换分支。分类和重试不是同一函数，不能因分类 helper 更新就宣称整条链路已消除误判。
+
+## 3. 历史证据：2026-09-11 / 4.6.9
+
+当时代码为 3d42ac0，Hermes custom provider 地址为 http://server.model.dpdns.org:8045/v1，模型为 gemini-3.8-flash-high。记录了两个启用账号，目标配额显示 96%，无 validation block 或 quota protection；模型列表成功、密钥哈希比对一致。以上均为历史状态，不代表当前部署。
+
+每组历史身份实验前清除了 Manager 本地限流，不能直接与当前未清理状态混比。
+
+| 请求 | 当时结果 |
+|---|---|
+| 中性简短 system | 200 |
+| 仅规范 Hermes 身份 | 429 |
 | 完整 Hermes system，无 tools | 429 |
 | 完整 Hermes system，含 20 tools | 429 |
-| 在 Hermes 身份前追加 Antigravity 身份 | 429 |
-| 替换 Hermes 身份前缀，保留其余提示和 tools | 200 + tool call |
+| Hermes 身份前追加 Antigravity 身份 | 429 |
+| 替换规范身份，保留约 29 KB 后缀及 20 tools | 200，产生 session_search 工具调用 |
 
-追加身份无效，证明上游不仅查看第一段身份，还会识别冲突身份。修复必须替换规范前缀，不能简单 prepend。
+同次记录中，简短请求流式/非流式均成功，含完整 tools 的简短请求成功；Chat 和 Responses 的完整 Hermes 请求均曾失败。这缩小了当时范围，不是永久排除鉴权、模型、工具、配额或传输问题。
 
-## 代码路径
+## 4. 当前代码路径
 
-请求入口：
+以下路径均相对于 src-tauri/src：
 
-```text
-src-tauri/src/proxy/server.rs
-  /v1/chat/completions -> handle_chat_completions
-  /v1/responses -> handle_completions
-```
+1. proxy/server.rs：/v1/chat/completions → handle_chat_completions()；/v1/responses、/responses → handle_completions()。
+2. proxy/handlers/openai.rs：Responses input/instructions 转入 OpenAI mapper；部分分支先把 instructions 转为 system message。
+3. proxy/mappers/openai/request.rs 的 transform_openai_request_with_session() 收集 system/developer 文本及独立 instructions。
+4. normalize_openai_client_identity() 使用 strip_prefix 精确匹配，返回 Cow。
+5. 归一化先于 compute_si_key、L1 lookup 和 sanitize_system_instruction_for_cache，再执行既有去重、context_blocks 分段、工具映射和 prefix hash 计算。
 
-OpenAI system message 收集：
+规范前缀：
 
-```text
-src-tauri/src/proxy/mappers/openai/request.rs:357-407
-```
+    You are Hermes Agent, an intelligent AI assistant created by Nous Research.
 
-当前流程只做 cache sanitize 和 dedupe，未做客户端身份归一化。
+替换身份：
 
-官方身份 fallback：
+    You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.
 
-```text
-src-tauri/src/proxy/mappers/openai/request.rs:1299-1341
-```
+不忽略前导空格、换行、BOM、大小写或缺失句号；user/assistant/tool 不参与归一化。后缀再次引用 Hermes 必须保留，不能全局删除。
 
-fallback 仅在没有 system/developer instructions 时生效。Hermes 自带 system prompt，因此不会使用 fallback。
+“逐字保留后缀”是身份函数契约。既有 sanitize/context_blocks 仍可能清洗动态字段、折叠空行和分类输出。端到端应与“仅手动替换前缀后经过相同 mapper”的结果比较，不能要求上游 JSON 等于原 OpenAI JSON。
 
-已有同类正确实现：
+## 5. 验证证据及适用范围
 
-```text
-src-tauri/src/proxy/mappers/claude/request.rs:11-27
-```
+旧构建证据见本地 dist/docker/build-info.json、build.log、test.log（产物可能未入库）：
 
-`normalize_claude_client_identity()` 将 Claude Agent SDK 的独立身份归一化为 Claude Code 身份，以避免同类 `RESOURCE_EXHAUSTED`。
+- 基线 d509491 加本地修改，版本 4.6.9。
+- cargo test --release --lib hermes -- --test-threads=1：8 passed，0 failed。
+- 统一镜像 antigravity-manager:hermes-20260912，linux/amd64。
+- 镜像 ID：sha256:b7e6549721e28e902aae5701e00f34e7d0c95fdad8e88c402f782db24647f0c4。
+- 归档 SHA-256：8660d15ae51b2bb3b6adca5cfd19fe76814e8c3dede451e9088f76c157a702d3。
+- 容器 health、HTML、主 JS 验证通过；没有真实上游验收证据。
 
-## 修复边界
+这些结果不适用于刚合并的 4.7.1。现存镜像及 dist 仍是旧产物，必须重新测试和构建新标签。用户确认已更新是有效反馈，但仍需镜像 ID 关联具体部署。
 
-应在 OpenAI mapper 内、cache key 计算之前处理身份。只匹配规范 Hermes system prompt 的开头，并只替换该前缀；后续 Hermes 指令、用户 system prompt、工具、消息历史全部保留。
+## 6. 当前 429 的复查顺序
 
-不应：
+1. 确认失败地址、容器、镜像 ID、模型映射及协议，避免测试到另一实例。
+2. 核查 instruction 来源、命中数量、长度、归一化前后摘要，不输出完整提示或凭据。
+3. 记录 Retry-After、details.reason、quotaResetDelay、时间窗口、匿名账号及实时配额；原始错误留存前脱敏。
+4. 同模型、协议、tools/history/参数下只改变身份：中性、Hermes、Antigravity。另做无工具/有工具两组，避免动态 requestType 混淆结论。
+5. 尊重冷却时间，优先隔离实例或等待到期，清空生产限流不是常规修复。
+6. 分别验证 Chat/Responses 流式、非流式、工具调用和第二轮上下文；真实配额不足仍应失败。
 
-- 修改 Hermes 源码或系统提示。
-- 删除或压缩 Hermes tools。
-- 对所有 system prompt 强制覆盖。
-- 用随机字符绕过分类，这会破坏 prompt cache。
-- 修改账号池限流语义来掩盖上游身份分类。
+中性/Antigravity 也失败时转查账号、速率、容量、项目和会话；仅 Hermes 失败时确认命中与其他指令残留。单次 200 或 health 成功不能关闭生产故障。
 
-## 风险
+## 7. 后续交付
 
-- 匹配过宽会修改用户自定义提示。
-- 在 cache sanitize 后修改会产生旧 cache 命中，导致修复不稳定。
-- 只修 chat path 会遗漏 Responses path；两者最终都必须经过共享 `transform_openai_request_with_session()`。
-- 追加而非替换会保留冲突身份，已验证仍失败。
-
-## 开发目标
-
-在不修改 Hermes、不减少其能力、不破坏 prompt cache 的前提下，让 `Antigravity-Manager` 将 Hermes 的规范 Agent 身份归一化为上游支持的 Antigravity 身份，使 `/v1/chat/completions` 与 `/v1/responses` 的完整 Hermes 请求稳定成功，并保持所有非 Hermes system prompt 字节不变。
+按 [Spec](../specs/2026-09-11-hermes-identity-normalization-spec.md) 和 [计划](../plans/2026-09-11-hermes-identity-normalization-plan.md) 完成合并后回归、前后端统一镜像重建和生产验收。更新必须保留旧镜像、数据备份和原配置，并提供回滚步骤。

@@ -59,8 +59,8 @@ RUN apt-get update && apt-get install -y \
 ENV CARGO_HTTP_MULTIPLEXING=false
 RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
     echo "Using Aliyun mirror for Cargo..."; \
-    mkdir -p /root/.cargo && \
-    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > /root/.cargo/config.toml; \
+    mkdir -p /usr/local/cargo && \
+    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > /usr/local/cargo/config.toml; \
     else \
     echo "Using default Cargo registry..."; \
     fi
@@ -80,8 +80,8 @@ COPY --from=frontend-builder /app/dist ./dist
 
 # Build the Rust backend in release mode (with BuildKit cache)
 WORKDIR /app/src-tauri
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
     cargo build --release --bin antigravity-tools && \
     cp target/release/antigravity-tools /tmp/antigravity-tools

@@ -1,373 +1,145 @@
-# Hermes 身份归一化实现计划
+# Hermes 身份归一化：上游同步后的开发与部署计划
 
-> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框跟踪进度。
+> 面向执行者：使用 executing-plans 或 subagent-driven-development 逐项执行。复选框表示真实完成状态，历史测试不能替代合并后的验证。
 
-**目标：** 在 OpenAI mapper 共享路径精确归一化 Hermes 官方身份，使完整 Hermes chat/Responses 请求通过 Antigravity 上游，同时完整保留其余提示和工具。
+**更新日期：** 2026-09-12
+**目标：** 在官方 4.7.1 基线上验证精准身份归一化，交付前后端统一镜像，完成 Chat/Responses 生产 429 闭环。
+**架构：** 复用共享 mapper 的 Cow/strip_prefix helper，在 L1 cache lookup 前替换；保留上游 requestType、会话、限流机制，通过实际协议证据定位剩余问题。
+**技术栈：** Rust stdlib、serde_json、现有 Cargo 测试、Axum、Vite、Docker BuildKit/Compose v2。
 
-**架构：** 在 `request.rs` 增加一个纯函数，使用 `strip_prefix` 精确识别 Hermes 规范身份并用现有 Antigravity 身份替换。函数在 system instructions 进入 cache sanitize 前运行，因此 chat 和 Responses 入口共享修复，且 normalized prompt 保持稳定缓存前缀。
+## 0. 当前状态
+
+- [x] 官方 upstream/main 已同步到 734e2bde5d60cd7ecffe2467b5cab9cb154a3f5e，当前合并提交 1ae1fa5。
+- [x] 本地修改已备份并恢复，无合并冲突；本地 main 与远端未被改写。
+- [x] 已有身份 helper、缓存前接入、mapper 合成测试；Docker 名称及 Cargo 路径修正已保留。
+- [x] 本次重写报告、Spec 和计划，区分历史证据与待验收项目。
+- [ ] 对合并后的 4.7.1 执行完整相关验证。
+- [ ] 重建并部署新的前后端统一镜像。
+- [ ] 复查用户更新后仍出现的生产 429。
+
+旧 dist/docker 与 dist 来自 4.6.9，可用于追溯，不能当作此次 4.7.1 成品。
+
+| 文件 | 职责 |
+|---|---|
+| src-tauri/src/proxy/mappers/openai/request.rs | 唯一身份归一化、内容及 prefix hash 回归 |
+| src-tauri/src/proxy/handlers/openai.rs、proxy/server.rs | 实际入口和协议转换测试，不复制身份 helper |
+| proxy/rate_limit.rs、handlers/common.rs、token_manager.rs、common/session.rs | 核查上游行为，复现证实后才修改额外问题；路径均在 src-tauri/src 下 |
+| docker/Dockerfile 及 backend/localdist 变体 | 统一镜像、正确二进制名与 Cargo 缓存路径 |
+| docker/HERMES_UPDATE.md | 补入验证后的新镜像、更新及回滚信息 |
+| dist/docker/ | 镜像包、校验值、构建信息和日志；不作为源码提交 |
+
+## 1. 核对合并结果
+
+- [ ] 阅读 734e2bd、a620ec2 与 mapper/handler 差异，确认身份归一化先于 SI key 和 L1 lookup。
+- [ ] 核对四种 instruction 形式及两个 handler 到共享 mapper 的调用链。
+- [ ] 确认动态 requestType、derive_session_scoped/bump、quota 分类未被本地补丁覆盖。
+- [ ] 审查并提交本地业务修改，记录可复现源码 SHA；确认恢复完整后再处理备份 stash。
+
+运行：
+
+    git merge-base --is-ancestor upstream/main HEAD
+    git diff --check
+    git diff -- src-tauri/src/proxy/mappers/openai/request.rs docker/
+
+## 2. 补齐回归
 
-**技术栈：** Rust、serde_json、`std::borrow::Cow`、Cargo tests、Axum OpenAI mapper。
-
----
-
-### 任务 1：建立身份归一化纯函数
-
-**文件：**
-- 修改：`src-tauri/src/proxy/mappers/openai/request.rs:1-30`
-- 测试：`src-tauri/src/proxy/mappers/openai/request.rs` 内现有 `#[cfg(test)]` 模块
-
-- [ ] **步骤 1：编写失败测试**
-
-在现有 test module 增加：
-
-```rust
-#[test]
-fn hermes_identity_prefix_is_normalized_without_losing_remainder() {
-    let remainder = "\n\nKeep every Hermes capability and tool instruction.";
-    let input = format!("{HERMES_AGENT_IDENTITY_PREFIX}{remainder}");
-
-    let normalized = normalize_openai_client_identity(&input);
-
-    assert!(normalized.starts_with(ANTIGRAVITY_AGENT_IDENTITY));
-    assert!(normalized.ends_with(remainder));
-    assert!(!normalized.contains(HERMES_AGENT_IDENTITY_PREFIX));
-}
-
-#[test]
-fn hermes_identity_mention_is_not_rewritten() {
-    let input = format!(
-        "Compatibility note: {HERMES_AGENT_IDENTITY_PREFIX}"
-    );
-
-    assert_eq!(normalize_openai_client_identity(&input), input);
-}
-
-#[test]
-fn unrelated_identity_is_borrowed_unchanged() {
-    let input = "You are a helpful assistant.";
-
-    assert!(matches!(
-        normalize_openai_client_identity(input),
-        std::borrow::Cow::Borrowed(_)
-    ));
-}
-```
-
-- [ ] **步骤 2：运行红灯**
-
-```powershell
-Set-Location F:\Documents\Project\Antigravity-Manager\src-tauri
-cargo test hermes_identity_prefix_is_normalized_without_losing_remainder --lib
-```
-
-预期：编译失败，因为常量和函数尚不存在。
-
-- [ ] **步骤 3：实现最小纯函数**
-
-在 imports 增加：
-
-```rust
-use std::borrow::Cow;
-```
-
-在模块级增加：
-
-```rust
-const HERMES_AGENT_IDENTITY_PREFIX: &str =
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research.";
-const ANTIGRAVITY_AGENT_IDENTITY: &str =
-    "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
-
-fn normalize_openai_client_identity(text: &str) -> Cow<'_, str> {
-    match text.strip_prefix(HERMES_AGENT_IDENTITY_PREFIX) {
-        Some(remainder) => Cow::Owned(format!(
-            "{ANTIGRAVITY_AGENT_IDENTITY}{remainder}"
-        )),
-        None => Cow::Borrowed(text),
-    }
-}
-```
-
-- [ ] **步骤 4：运行纯函数测试**
-
-```powershell
-cargo test hermes_identity --lib
-```
-
-预期：三个测试通过。
-
-- [ ] **步骤 5：提交**
-
-```powershell
-git add src-tauri/src/proxy/mappers/openai/request.rs
-git commit -m "fix(openai): normalize Hermes agent identity"
-```
-
----
-
-### 任务 2：接入共享 OpenAI system instruction 流程
-
-**文件：**
-- 修改：`src-tauri/src/proxy/mappers/openai/request.rs:357-407`
-- 测试：`src-tauri/src/proxy/mappers/openai/request.rs`
-
-- [ ] **步骤 1：编写转换层失败测试**
-
-在现有 OpenAI mapper tests 增加：
-
-```rust
-#[test]
-fn transform_normalizes_hermes_identity_and_preserves_tools() {
-    let remainder = "\n\nHermes-specific instructions remain intact.";
-    let request: OpenAIRequest = serde_json::from_value(json!({
-        "model": "gemini-3.8-flash-high",
-        "messages": [
-            {
-                "role": "system",
-                "content": format!(
-                    "{HERMES_AGENT_IDENTITY_PREFIX}{remainder}"
-                )
-            },
-            {"role": "user", "content": "hello"}
-        ],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "session_search",
-                "description": "Search sessions",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        }]
-    }))
-    .unwrap();
-
-    let (body, _, _, _) = transform_openai_request(
-        &request,
-        "test-project",
-        "gemini-3.8-flash-high",
-        None,
-    );
-    let system = body["request"]["systemInstruction"]["parts"][0]["text"]
-        .as_str()
-        .unwrap();
-
-    assert!(system.contains(ANTIGRAVITY_AGENT_IDENTITY));
-    assert!(system.contains("Hermes-specific instructions remain intact."));
-    assert!(!system.contains(HERMES_AGENT_IDENTITY_PREFIX));
-    assert_eq!(
-        body["request"]["tools"][0]["functionDeclarations"][0]["name"],
-        "session_search"
-    );
-}
-```
-
-- [ ] **步骤 2：运行红灯**
-
-```powershell
-cargo test transform_normalizes_hermes_identity_and_preserves_tools --lib
-```
-
-预期：失败，输出仍包含 Hermes identity。
-
-- [ ] **步骤 3：在 cache 前接入归一化**
-
-修改 `system_instructions` 的 map，在 `compute_si_key()` 之前处理：
-
-```rust
-system_instructions = system_instructions
-    .into_iter()
-    .map(|instruction| {
-        normalize_openai_client_identity(&instruction).into_owned()
-    })
-    .collect();
-```
-
-该代码必须位于现有 cache sanitize map 之前。不要修改 `sanitize_system_instruction_for_cache()`，因为身份归一化不是动态字段清洗。
-
-- [ ] **步骤 4：运行 mapper 测试**
-
-```powershell
-cargo test transform_normalizes_hermes_identity_and_preserves_tools --lib
-cargo test proxy::mappers::openai::request --lib
-```
-
-预期：全部通过。
-
-- [ ] **步骤 5：提交**
-
-```powershell
-git add src-tauri/src/proxy/mappers/openai/request.rs
-git commit -m "fix(openai): apply identity normalization before caching"
-```
-
----
-
-### 任务 3：覆盖 Responses 路径与缓存稳定性
-
-**文件：**
-- 修改：`src-tauri/src/proxy/mappers/openai/request.rs`，仅增加测试
-- 测试：`src-tauri/src/proxy/mappers/openai/request.rs` 的现有 test module
-
-- [ ] **步骤 1：增加 Responses 转换测试**
-
-直接构造带 `instructions` 的 `OpenAIRequest`。Responses handler 已将
-`instructions` 写入该字段，共享 mapper 会在 380-385 行把它放入
-`system_instructions`：
-
-```rust
-#[test]
-fn responses_hermes_instructions_reach_shared_normalizer() {
-    let request: OpenAIRequest = serde_json::from_value(json!({
-        "model": "gemini-3.8-flash-high",
-        "instructions": format!(
-            "{HERMES_AGENT_IDENTITY_PREFIX}\n\nKeep Hermes rules."
-        ),
-        "messages": [{"role": "user", "content": "hello"}],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "session_search",
-                "description": "Search sessions",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        }]
-    }))
-    .unwrap();
-    let (body, _, _, _) = transform_openai_request(
-        &request,
-        "test-project",
-        "gemini-3.8-flash-high",
-        None,
-    );
-    let system = body["request"]["systemInstruction"]["parts"][0]["text"]
-        .as_str()
-        .unwrap();
-
-    assert!(system.contains(ANTIGRAVITY_AGENT_IDENTITY));
-    assert!(system.contains("Keep Hermes rules."));
-}
-```
-
-- [ ] **步骤 2：增加缓存稳定测试**
-
-```rust
-#[test]
-fn normalized_hermes_prompt_is_byte_stable() {
-    let prompt = format!(
-        "{HERMES_AGENT_IDENTITY_PREFIX}\n\nStable Hermes rules."
-    );
-    let first = normalize_openai_client_identity(&prompt).into_owned();
-    let second = normalize_openai_client_identity(&prompt).into_owned();
-
-    assert_eq!(first, second);
-    assert_eq!(
-        CacheManager::compute_si_key(&first),
-        CacheManager::compute_si_key(&second)
-    );
-}
-```
-
-- [ ] **步骤 3：运行 OpenAI/Responses 测试**
-
-```powershell
-cargo test responses_hermes --lib
-cargo test normalized_hermes_prompt_is_byte_stable --lib
-cargo test proxy::mappers::openai::request --lib
-```
-
-- [ ] **步骤 4：提交测试**
-
-```powershell
-git add src-tauri/src/proxy/mappers/openai/request.rs
-git commit -m "test(openai): cover Hermes identity across protocols"
-```
-
----
-
-### 任务 4：完整验证
-
-- [ ] **步骤 1：格式化与静态检查**
-
-```powershell
-Set-Location F:\Documents\Project\Antigravity-Manager\src-tauri
-cargo fmt --check
-cargo check --lib
-```
-
-- [ ] **步骤 2：运行相关完整测试**
-
-```powershell
-cargo test proxy::mappers::openai --lib
-cargo test proxy::handlers::openai --lib
-cargo test proxy::session_manager --lib
-cargo test proxy::token_manager --lib
-```
-
-- [ ] **步骤 3：审查 diff**
-
-```powershell
-Set-Location F:\Documents\Project\Antigravity-Manager
-git diff --check
-git status --short --branch
-git diff HEAD~3 -- src-tauri/src/proxy/mappers/openai/request.rs
-```
-
-必须确认：没有账号池、限流、模型映射、UI 或配置文件改动。
-
----
-
-### 任务 5：部署与真实验收
-
-- [ ] **步骤 1：构建与部署 Manager**
-
-按该项目现有 backend/Docker 发布流程构建 4.6.9 后续版本。记录部署 SHA，保留当前服务回滚镜像或二进制。
-
-- [ ] **步骤 2：健康检查**
-
-```bash
-curl http://server.model.dpdns.org:8045/health
-```
-
-预期返回新版本和 `status=ok`。
-
-- [ ] **步骤 3：生产最小身份矩阵**
-
-每个测试使用合成文本，不上传真实历史：
-
-```text
-neutral identity -> 200
-Hermes canonical identity -> 200
-Hermes identity mention in middle -> 200 and unchanged
-full Hermes-shaped request with tools -> 200/tool call
-```
-
-- [ ] **步骤 4：Hermes 真实管线验收**
-
-在 130 使用现有 custom provider，保持 Hermes 原始系统提示和工具：
-
-```bash
-hermes -z "Reply with exactly: HERMES_OK" \
-  -m gemini-3.8-flash-high --provider custom --safe-mode
-```
-
-预期：返回 `HERMES_OK`，Gateway 日志不出现 `All accounts exhausted`。
-
-- [ ] **步骤 5：QQBot 验收**
-
-新建 QQ 会话并发送普通消息，再执行一个安全工具调用。预期文本回复和工具调用均成功，连续两轮保持上下文。
-
-- [ ] **步骤 6：失败边界验收**
-
-真实耗尽账号时仍应返回 429/503，不能由身份归一化清除真实限流记录或无限重试。
-
-## 完成标准
-
-- 三类单元测试全部通过。
-- chat 和 Responses 共享归一化，无重复 handler 逻辑。
-- 完整 Hermes prompt 和 tools 保留。
-- normalized prefix byte-stable。
-- 生产身份矩阵通过。
-- 130 Hermes CLI 返回 `HERMES_OK`。
-- QQBot 文本、工具和第二轮上下文通过。
-- 非 Hermes 请求行为不变。
-- 真实配额错误仍正确返回。
+- [ ] 运行现有 Hermes 测试，复用现有 helper，不重复实施已有功能。
+- [ ] 补齐 BOM、大小写、缺句号、前导空白、后缀再次引用；断言严格等式与 Cow::Borrowed。
+- [ ] 补齐 tool 返回、媒体、tool_choice/thinking、多轮历史，与“手动只替换前缀”的 mapper 输出比较。
+- [ ] 保留 20 个合成工具、四种 instruction 形式、实际 prefix hash 及重复转换测试。
+- [ ] 增加实际 handler/mock 上游覆盖：Chat、/v1/responses、/responses，stream true/false，工具往返。直接构造 OpenAIRequest.instructions 不等于 HTTP Responses 已验证。
+- [ ] 对新增测试确认能捕获对应回归，再做必要的最小修复。
+
+在具备 Linux 构建依赖的环境、src-tauri 目录执行：
+
+    cargo test --release --lib hermes -- --test-threads=1
+    cargo test --release --lib unrelated_identity_is_borrowed_unchanged
+    cargo test --release --lib proxy::mappers::openai -- --test-threads=1
+    cargo test --release --lib proxy::handlers::openai -- --test-threads=1
+    cargo test --release --lib proxy::handlers::common -- --test-threads=1
+    cargo test --release --lib proxy::rate_limit -- --test-threads=1
+    cargo test --release --lib proxy::token_manager -- --test-threads=1
+    cargo test --release --lib proxy::common::session -- --test-threads=1
+    cargo test --release --lib proxy::session_manager -- --test-threads=1
+    cargo check --lib
+    cargo fmt --check
+
+记录失败属于上游基线还是本地修改。全仓格式化已有历史差异时限定修改范围并说明，不顺手格式化全部文件。Windows 缺 libclang 不能作为测试通过。
+
+## 3. 构建统一镜像
+
+- [ ] 用同一份已审查源码构建前后端，避免复用旧 dist。
+- [ ] 确认 cargo build --release --bin antigravity-tools 与 /usr/local/cargo 镜像源、缓存配置。
+- [ ] 使用新唯一标签，记录源码 SHA、工作区状态、平台和构建命令。
+
+在仓库根目录、Linux amd64 / BuildKit 环境执行：
+
+    set -eu
+    TAG="antigravity-manager:4.7.1-hermes-$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+    docker build --platform linux/amd64 -f docker/Dockerfile -t "$TAG" .
+
+需加速时使用已验证镜像源及 --build-arg USE_MIRROR=true。若使用 localdist，必须先 npm ci --legacy-peer-deps、npm run build，再用 docker/Dockerfile.backend.localdist 构建。最终仍包含前端与后端。
+
+- [ ] 临时数据/密钥的隔离容器中验证 health=ok、HTML/JS 字节一致、二进制可执行。
+- [ ] 导出镜像与校验值，构建信息随包交付。
+
+    set -o pipefail
+    ARCHIVE="antigravity-manager-4.7.1-hermes-linux-amd64-$(date +%Y%m%d%H%M%S).tar.gz"
+    docker save "$TAG" | gzip -1 > "$ARCHIVE"
+    sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+    docker image inspect "$TAG" --format '{{.Id}} {{.Os}}/{{.Architecture}}'
+
+## 4. 更新已有容器与回滚
+
+以下 Bash 示例适用于仓库默认 Compose 布局。自定义部署必须沿用原 -p、-f、--env-file、容器名和数据挂载源；先确认实际值再执行。沿用原密钥，不把示例 API_KEY=test 带入生产。
+
+- [ ] 核对原容器、image ID、端口、账号数据及有无外挂 /app/dist；外挂前端会遮住镜像内新产物。
+- [ ] 镜像包在目标机执行 sha256sum -c "$ARCHIVE.sha256"、docker load -i "$ARCHIVE"；将 TAG 设置为记录的新镜像标签。
+- [ ] 保存旧镜像、原 Compose/.env 与一致数据备份，限制备份访问权限。
+
+默认部署示例，先构建/导入新镜像，之后才短暂停机：
+
+    set -eu
+    SERVICE=antigravity-manager
+    ROLLBACK="antigravity-manager:rollback-$(date +%Y%m%d%H%M%S)"
+    docker tag "$(docker inspect --format '{{.Image}}' "$SERVICE")" "$ROLLBACK"
+    OVERRIDE=docker/compose.hermes-image.yml
+    printf 'services:\n  antigravity-manager:\n    image: %s\n' "$TAG" > "$OVERRIDE"
+    docker compose -f docker/docker-compose.yml stop "$SERVICE"
+    BACKUP="$HOME/antigravity-data-$(date +%Y%m%d%H%M%S).tar.gz"
+    if ! (umask 077; tar -czf "$BACKUP" -C "$HOME" .antigravity_tools); then
+      docker compose -f docker/docker-compose.yml start "$SERVICE"
+      exit 1
+    fi
+    docker compose -f docker/docker-compose.yml -f "$OVERRIDE" up -d --no-build --pull never "$SERVICE"
+    docker inspect --format '{{.Image}}' "$SERVICE"
+    docker image inspect "$TAG" --format '{{.Id}}'
+    curl --fail --retry 12 --retry-connrefused --retry-delay 5 http://127.0.0.1:8045/health
+
+- [ ] 两个镜像 ID 一致，health 为本次 4.7.1，页面/资源成功；访问地址按实际绑定及反代调整。
+- [ ] 再做第 5 节真实推理验收，health 正常不能替代生产请求。
+- [ ] 失败则切回记录的 ROLLBACK 标签，用相同部署参数重建容器：
+
+    printf 'services:\n  antigravity-manager:\n    image: %s\n' "$ROLLBACK" > "$OVERRIDE"
+    docker compose -f docker/docker-compose.yml -f "$OVERRIDE" up -d --no-build --pull never "$SERVICE"
+    curl --fail --retry 12 --retry-connrefused --retry-delay 5 http://127.0.0.1:8045/health
+
+不要删除数据卷。跨版本配置回滚需验证；确需恢复备份时先停服务并评估备份后的数据变更。部署记录保存具体镜像标签、归档和备份路径，不能只依赖 shell 变量。
+
+## 5. 生产 429 复查
+
+- [ ] 确认用户实际报错的实例和镜像 ID，检查脱敏请求的身份命中情况。
+- [ ] 刷新配额，记录时间、模型映射、匿名账号、Retry-After、details.reason 和 quotaResetDelay；面板百分比与通用错误都不能单独定因。
+- [ ] 同协议、模型、tools/history/参数下只改身份：中性、规范 Hermes、手动 Antigravity。按无工具/有工具分组，避免 requestType 混淆。
+- [ ] 先非流式再流式，覆盖 Chat 与 Responses（包括别名）；记录请求摘要、HTTP 状态、结束事件及工具结果。
+- [ ] 冷却期间等待或使用隔离实例，不反复清空生产限流，不以无限重试取得一次成功。
+- [ ] 原 Hermes custom provider 完整请求保留全部工具，完成一次安全工具调用及第二轮上下文；随后由用户完成 QQBot 验收。
+- [ ] mock 配额/容量错误，确认仍正确传播。
+
+中性和 Antigravity 也失败时查容量、配额、项目或会话；仅 Hermes 失败时查命中与其他指令残留。证据不足时记录待补项，不扩大匹配规则碰运气。
+
+## 6. 完成标准
+
+合并后回归、统一镜像、部署验证、生产矩阵均有证据；Chat/Responses 文本、工具和上下文正常；真实限流仍正确失败。随后更新 [报告](../reviews/2026-09-11-hermes-identity-investigation.md) 和 [Spec](../specs/2026-09-11-hermes-identity-normalization-spec.md) 状态。
+
+本次仅同步源码和重写文档，不代表上述待办已经执行。旧 4.6.9 镜像、8 项测试和容器验证只作历史记录。
