@@ -7,6 +7,9 @@ use tauri::State;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 
+/// 内存日志队列默认最大保留条数（历史日志已持久化至 SQLite，内存中仅保留最近摘要以防 OOM）
+const DEFAULT_MAX_MEMORY_LOGS: usize = 100;
+
 /// 反代服务状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStatus {
@@ -110,7 +113,7 @@ pub async fn internal_start_proxy_service(
                 } else {
                     None
                 };
-            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
+            *monitor_lock = Some(Arc::new(ProxyMonitor::new(DEFAULT_MAX_MEMORY_LOGS, app_handle)));
         }
         // Sync enabled state from config
         if let Some(monitor) = monitor_lock.as_ref() {
@@ -231,7 +234,7 @@ pub async fn ensure_admin_server(
                 } else {
                     None
                 };
-            *monitor_lock = Some(Arc::new(ProxyMonitor::new(1000, app_handle)));
+            *monitor_lock = Some(Arc::new(ProxyMonitor::new(DEFAULT_MAX_MEMORY_LOGS, app_handle)));
         }
         monitor_lock.as_ref().unwrap().clone()
     };

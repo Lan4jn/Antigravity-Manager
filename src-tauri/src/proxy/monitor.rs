@@ -33,6 +33,20 @@ pub struct ProxyStats {
     pub error_count: u64,
 }
 
+/// 常驻内存的请求/响应体最大字节数（16KB），超出则截断，防止大 prompt/response 膨胀撑爆内存
+const MAX_MEMORY_BODY_BYTES: usize = 16 * 1024;
+
+fn truncate_string_safe(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut truncate_at = max_bytes;
+        while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        s.truncate(truncate_at);
+        s.push_str("... [TRUNCATED FOR IN-MEMORY CACHE]");
+    }
+}
+
 pub struct ProxyMonitor {
     pub logs: RwLock<VecDeque<ProxyRequestLog>>,
     pub stats: RwLock<ProxyStats>,
@@ -142,13 +156,21 @@ impl ProxyMonitor {
             }
         }
 
-        // Add log to memory
+        // Add log to memory (with truncation for memory efficiency)
         {
+            let mut memory_log = log.clone();
+            if let Some(req) = &mut memory_log.request_body {
+                truncate_string_safe(req, MAX_MEMORY_BODY_BYTES);
+            }
+            if let Some(resp) = &mut memory_log.response_body {
+                truncate_string_safe(resp, MAX_MEMORY_BODY_BYTES);
+            }
+
             let mut logs = self.logs.write().await;
             if logs.len() >= self.max_logs {
                 logs.pop_back();
             }
-            logs.push_front(log.clone());
+            logs.push_front(memory_log);
         }
 
         // Save to DB
@@ -278,5 +300,78 @@ impl ProxyMonitor {
             }
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_string_safe() {
+        let mut short_str = "hello world".to_string();
+        truncate_string_safe(&mut short_str, 20);
+        assert_eq!(short_str, "hello world");
+
+        // 中文字符多字节截断保护（每个汉字3字节）
+        let mut chinese_str = "这是一段测试中文文本，用于验证多字节截断安全".to_string();
+        truncate_string_safe(&mut chinese_str, 10);
+        assert!(chinese_str.ends_with("... [TRUNCATED FOR IN-MEMORY CACHE]"));
+
+        // 超大文本截断
+        let mut large_str = "A".repeat(20 * 1024);
+        truncate_string_safe(&mut large_str, MAX_MEMORY_BODY_BYTES);
+        assert!(large_str.contains("... [TRUNCATED FOR IN-MEMORY CACHE]"));
+        assert!(large_str.len() <= MAX_MEMORY_BODY_BYTES + 40);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_memory_log_capacity_and_truncation() {
+        let monitor = ProxyMonitor::new(2, None);
+        monitor.set_enabled(true);
+
+        let mut log1 = ProxyRequestLog {
+            id: "1".to_string(),
+            timestamp: 100,
+            method: "POST".to_string(),
+            url: "/v1/chat".to_string(),
+            status: 200,
+            duration: 50,
+            model: Some("test".to_string()),
+            mapped_model: Some("test".to_string()),
+            account_email: None,
+            client_ip: None,
+            request_body: Some("B".repeat(20 * 1024)),
+            response_body: Some("C".repeat(30 * 1024)),
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            protocol: None,
+            username: None,
+            error: None,
+        };
+
+        monitor.log_request(log1.clone()).await;
+
+        {
+            let logs = monitor.logs.read().await;
+            assert_eq!(logs.len(), 1);
+            let first = &logs[0];
+            assert!(first.request_body.as_ref().unwrap().contains("[TRUNCATED"));
+            assert!(first.response_body.as_ref().unwrap().contains("[TRUNCATED"));
+        }
+
+        // 插入第2和第3条，验证最大容量为 2
+        log1.id = "2".to_string();
+        monitor.log_request(log1.clone()).await;
+        log1.id = "3".to_string();
+        monitor.log_request(log1.clone()).await;
+
+        {
+            let logs = monitor.logs.read().await;
+            assert_eq!(logs.len(), 2);
+            assert_eq!(logs[0].id, "3");
+            assert_eq!(logs[1].id, "2");
+        }
     }
 }
