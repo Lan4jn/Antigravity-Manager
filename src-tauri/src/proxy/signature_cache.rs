@@ -44,16 +44,17 @@ fn evict_oldest_if_needed<V, F>(cache: &mut HashMap<String, V>, limit: usize, mu
 where
     F: FnMut(&V) -> SystemTime,
 {
-    while cache.len() > limit {
-        if let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, v)| get_time(v))
-            .map(|(k, _)| k.clone())
-        {
-            cache.remove(&oldest_key);
-        } else {
-            break;
-        }
+    if cache.len() <= limit {
+        return;
+    }
+    let excess = cache.len() - limit;
+    let mut items: Vec<(String, SystemTime)> = cache
+        .iter()
+        .map(|(k, v)| (k.clone(), get_time(v)))
+        .collect();
+    items.sort_unstable_by_key(|(_, t)| *t);
+    for (k, _) in items.into_iter().take(excess) {
+        cache.remove(&k);
     }
 }
 
