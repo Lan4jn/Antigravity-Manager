@@ -134,6 +134,11 @@ pub struct ProxyToken {
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
 }
 
+/// 会话绑定映射保留时间：2小时（未活跃则自动淘汰）
+const SESSION_ACCOUNT_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+/// 后台会话自动清理间隔：60秒
+const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
     current_index: Arc<AtomicUsize>,
@@ -222,7 +227,7 @@ impl TokenManager {
 
         let handle = tokio::spawn(async move {
             let mut rate_limit_interval = tokio::time::interval(std::time::Duration::from_secs(15));
-            let mut session_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut session_interval = tokio::time::interval(SESSION_CLEANUP_INTERVAL);
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -239,10 +244,16 @@ impl TokenManager {
                         }
                     }
                     _ = session_interval.tick() => {
-                        Self::cleanup_expired_sessions_map(
+                        let cleaned = Self::cleanup_expired_sessions_map(
                             &session_accounts,
-                            std::time::Duration::from_secs(2 * 3600),
+                            SESSION_ACCOUNT_TTL,
                         );
+                        if cleaned > 0 {
+                            tracing::info!(
+                                "Auto-cleanup: Removed {} expired session account mapping(s)",
+                                cleaned
+                            );
+                        }
                     }
                 }
             }
@@ -3452,21 +3463,9 @@ impl TokenManager {
         self.session_accounts.remove(session_id);
     }
 
-    /// 解绑指定 session 的账号映射（别名）
-    #[allow(dead_code)]
-    pub fn unbind_session(&self, session_id: &str) {
-        self.clear_session_binding(session_id);
-    }
-
     /// 清除所有会话的粘性映射
     pub fn clear_all_sessions(&self) {
         self.session_accounts.clear();
-    }
-
-    /// 清除所有会话的粘性映射（别名）
-    #[allow(dead_code)]
-    pub fn clear_session_bindings(&self) {
-        self.clear_all_sessions();
     }
 
     /// 清理已过期的会话绑定记录
@@ -3475,7 +3474,7 @@ impl TokenManager {
     }
 
     /// 内部辅助函数：清理 DashMap 中超过指定时长的会话记录
-    pub(crate) fn cleanup_expired_sessions_map(
+    fn cleanup_expired_sessions_map(
         session_accounts: &DashMap<String, (String, std::time::Instant)>,
         max_age: std::time::Duration,
     ) -> usize {
@@ -5362,9 +5361,9 @@ mod tests {
         let now = std::time::Instant::now();
         let past = now
             .checked_sub(std::time::Duration::from_secs(100))
-            .expect("Instant sub overflow");
+            .unwrap_or(now);
 
-        // 插入一个过期会话和一个活跃会话
+        // 插入过期会话、活跃会话、以及未来时间戳（时钟回拨容错测试）
         manager.session_accounts.insert(
             "expired_session".to_string(),
             ("acc_expired".to_string(), past),
@@ -5372,6 +5371,13 @@ mod tests {
         manager.session_accounts.insert(
             "active_session".to_string(),
             ("acc_active".to_string(), now),
+        );
+        let future = now
+            .checked_add(std::time::Duration::from_secs(60))
+            .unwrap_or(now);
+        manager.session_accounts.insert(
+            "future_session".to_string(),
+            ("acc_future".to_string(), future),
         );
 
         // 使用 50 秒作为过期阈值进行清理
@@ -5387,6 +5393,10 @@ mod tests {
             manager.session_accounts.contains_key("active_session"),
             "活跃会话应被保留"
         );
+        assert!(
+            manager.session_accounts.contains_key("future_session"),
+            "未来时钟会话应被保留（时钟回拨保护）"
+        );
         assert_eq!(
             manager
                 .session_accounts
@@ -5395,19 +5405,20 @@ mod tests {
             Some("acc_active".to_string())
         );
 
+        // 测试滑动窗口刷新：更新 active_session 访问时间
+        if let Some(mut entry) = manager.session_accounts.get_mut("active_session") {
+            entry.1 = std::time::Instant::now();
+        }
+
         // 再次清理，应无会话被移除
         let removed_again = manager.cleanup_expired_sessions(max_age);
         assert_eq!(removed_again, 0, "再次清理不应移除任何未过期会话");
 
-        // 测试别名方法 unbind_session 和 clear_session_bindings
-        manager.session_accounts.insert(
-            "session_to_unbind".to_string(),
-            ("acc_to_unbind".to_string(), now),
-        );
-        manager.unbind_session("session_to_unbind");
-        assert!(!manager.session_accounts.contains_key("session_to_unbind"));
+        // 测试手动解绑方法 clear_session_binding 与 clear_all_sessions
+        manager.clear_session_binding("active_session");
+        assert!(!manager.session_accounts.contains_key("active_session"));
 
-        manager.clear_session_bindings();
+        manager.clear_all_sessions();
         assert!(manager.session_accounts.is_empty());
     }
 }
