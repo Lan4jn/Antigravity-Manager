@@ -631,13 +631,13 @@ mod tests {
         // Normal turn_index <= 500 should succeed
         cache.append_reasoning("sess_1", "valid reasoning".to_string(), 500);
         assert_eq!(
-            cache.get_session_reasoning("sess_1"),
+            cache.get_session_reasoning("sess_1", 500),
             Some("valid reasoning".to_string())
         );
 
         // turn_index > 500 should be ignored (no huge resize or panic)
         cache.append_reasoning("sess_malicious", "attack".to_string(), 501);
-        assert_eq!(cache.get_session_reasoning("sess_malicious"), None);
+        assert_eq!(cache.get_session_reasoning("sess_malicious", 501), None);
         assert_eq!(cache.reasoning_cache_len(), 1);
     }
 
@@ -653,9 +653,9 @@ mod tests {
         }
 
         assert_eq!(cache.reasoning_cache_len(), SESSION_CACHE_LIMIT);
-        assert_eq!(cache.get_session_reasoning("session_oldest"), None);
+        assert_eq!(cache.get_session_reasoning("session_oldest", 0), None);
         assert!(cache
-            .get_session_reasoning(&format!("session_{}", SESSION_CACHE_LIMIT - 1))
+            .get_session_reasoning(&format!("session_{}", SESSION_CACHE_LIMIT - 1), 0)
             .is_some());
     }
 }
