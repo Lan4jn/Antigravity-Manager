@@ -1144,4 +1144,34 @@ mod tests {
         assert_eq!(cache.get_session_reasoning("reas_lru_b", 0), None);
         assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
     }
+
+    #[test]
+    fn test_a9_rewind_and_same_turn_replacement() {
+        let cache = SignatureCache::new();
+
+        // 1. 写入 1..5 轮
+        for turn in 1..=5 {
+            cache.cache_session_signature("sess_rewind", format!("{}_{}", "x".repeat(50), turn), turn);
+        }
+        assert!(cache.get_session_signature_at("sess_rewind", 5).is_some());
+
+        // 2. Rewind 到第 3 轮（重新生成第 3 轮）
+        let sig3_new = format!("{}_rewind_v2", "y".repeat(60));
+        cache.cache_session_signature("sess_rewind", sig3_new.clone(), 3);
+
+        // 验证：第 4 轮和第 5 轮应当被彻底删除（未来历史被丢弃）
+        assert_eq!(cache.get_session_signature_at("sess_rewind", 4), None);
+        assert_eq!(cache.get_session_signature_at("sess_rewind", 5), None);
+        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_new.clone()));
+
+        // 3. 同轮更短签名替换测试：尝试用更短签名覆盖第 3 轮，应当被拒绝，保留较长签名
+        let sig3_shorter = format!("{}_short", "z".repeat(50));
+        cache.cache_session_signature("sess_rewind", sig3_shorter, 3);
+        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_new.clone()));
+
+        // 4. 同轮更长签名替换测试：用更长签名覆盖第 3 轮，应当成功替换
+        let sig3_longer = format!("{}_much_longer_version", "w".repeat(80));
+        cache.cache_session_signature("sess_rewind", sig3_longer.clone(), 3);
+        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_longer));
+    }
 }
