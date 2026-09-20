@@ -489,12 +489,7 @@ impl AxumServer {
 
     /// 更新代理池配置
     pub async fn update_proxy_pool(&self, new_config: crate::proxy::config::ProxyPoolConfig) {
-        {
-            let mut pool = self.proxy_pool_state.write().await;
-            *pool = new_config;
-        }
-        // [HOT-RELOAD] Re-sync in-memory account↔proxy bindings from the new config
-        self.proxy_pool_manager.sync_bindings_from_config().await;
+        self.proxy_pool_manager.update_config(new_config).await;
         // [HOT-RELOAD] Drop cached per-proxy HTTP clients so they rebuild with new URLs/credentials
         self.upstream.clear_client_cache();
         tracing::info!("Proxy pool config hot-reloaded");

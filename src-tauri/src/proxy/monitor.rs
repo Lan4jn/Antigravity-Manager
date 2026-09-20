@@ -36,6 +36,8 @@ pub struct ProxyStats {
 /// 常驻内存的请求/响应体最大字节数（16KB），超出则截断，防止大 prompt/response 膨胀撑爆内存
 const MAX_MEMORY_BODY_BYTES: usize = 16 * 1024;
 
+const TRUNCATION_SUFFIX: &str = "... [TRUNCATED FOR IN-MEMORY CACHE]";
+
 fn truncate_str_safe(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         s.to_string()
@@ -44,9 +46,9 @@ fn truncate_str_safe(s: &str, max_bytes: usize) -> String {
         while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
             truncate_at -= 1;
         }
-        let mut out = String::with_capacity(truncate_at + 35);
+        let mut out = String::with_capacity(truncate_at + TRUNCATION_SUFFIX.len());
         out.push_str(&s[..truncate_at]);
-        out.push_str("... [TRUNCATED FOR IN-MEMORY CACHE]");
+        out.push_str(TRUNCATION_SUFFIX);
         out
     }
 }
@@ -331,20 +333,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_str_safe() {
-        let short_str = "hello world";
-        assert_eq!(truncate_str_safe(short_str, 20), "hello world");
+    fn test_truncate_str_safe_a1_a2() {
+        // A1: 10 MiB 正文得到合法预览，capacity 达到 G1 上限；原正文不变
+        let orig_10m = "A".repeat(10 * 1024 * 1024);
+        let prev_10m = truncate_str_safe(&orig_10m, MAX_MEMORY_BODY_BYTES);
+        assert!(prev_10m.ends_with(TRUNCATION_SUFFIX));
+        assert_eq!(prev_10m.len(), MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
+        assert!(prev_10m.capacity() <= MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
+        assert_eq!(orig_10m.len(), 10 * 1024 * 1024, "原 10 MiB 正文不被修改");
 
-        // 中文字符多字节截断保护（每个汉字3字节）
-        let chinese_str = "这是一段测试中文文本，用于验证多字节截断安全";
-        let truncated_cn = truncate_str_safe(chinese_str, 10);
-        assert!(truncated_cn.ends_with("... [TRUNCATED FOR IN-MEMORY CACHE]"));
+        // A2: 空/None/短文本大 capacity / 恰好上限 / 中文与 emoji 4 字节边界
+        assert_eq!(truncate_str_safe("", 16384), "");
 
-        // 超大文本截断
-        let large_str = "A".repeat(20 * 1024);
-        let truncated_large = truncate_str_safe(&large_str, MAX_MEMORY_BODY_BYTES);
-        assert!(truncated_large.contains("... [TRUNCATED FOR IN-MEMORY CACHE]"));
-        assert!(truncated_large.len() <= MAX_MEMORY_BODY_BYTES + 40);
+        let exact_str = "X".repeat(MAX_MEMORY_BODY_BYTES);
+        let exact_prev = truncate_str_safe(&exact_str, MAX_MEMORY_BODY_BYTES);
+        assert_eq!(exact_prev.len(), MAX_MEMORY_BODY_BYTES);
+        assert!(!exact_prev.contains(TRUNCATION_SUFFIX));
+
+        // 短文本带 10MB capacity 被紧凑化构造，不带入空闲容量
+        let mut short_with_huge_cap = String::with_capacity(10 * 1024 * 1024);
+        short_with_huge_cap.push_str("short payload");
+        let short_prev = truncate_str_safe(&short_with_huge_cap, MAX_MEMORY_BODY_BYTES);
+        assert_eq!(short_prev, "short payload");
+        assert!(short_prev.capacity() < 64);
+
+        // 中文多字节截断 (3 字节/字符)
+        let cn_str = "这是一段测试中文文本，用于验证多字节截断安全";
+        let cn_prev = truncate_str_safe(cn_str, 10);
+        assert!(cn_prev.ends_with(TRUNCATION_SUFFIX));
+
+        // Emoji 边界截断 (4 字节/字符: 🦀 = 0xF0 0x9F 0xA6 0x80)
+        let emoji_str = "🦀".repeat(5000); // 20,000 字节
+        let emoji_prev = truncate_str_safe(&emoji_str, MAX_MEMORY_BODY_BYTES);
+        assert!(emoji_prev.ends_with(TRUNCATION_SUFFIX));
+        assert!(emoji_prev.len() <= MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
     }
 
     #[tokio::test]
