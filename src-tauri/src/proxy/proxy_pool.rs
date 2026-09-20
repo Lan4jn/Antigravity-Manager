@@ -9,39 +9,46 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use rquest_util::Emulation;
-use std::sync::OnceLock;
+use std::sync::RwLock as StdRwLock;
 
 /// 全局代理池管理器单例
-pub static GLOBAL_PROXY_POOL: OnceLock<Arc<ProxyPoolManager>> = OnceLock::new();
+static GLOBAL_PROXY_POOL: StdRwLock<Option<Arc<ProxyPoolManager>>> = StdRwLock::new(None);
 static PROXY_POOL_INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 获取全局代理池管理器
 pub fn get_global_proxy_pool() -> Option<Arc<ProxyPoolManager>> {
-    GLOBAL_PROXY_POOL.get().cloned()
+    GLOBAL_PROXY_POOL.read().ok().and_then(|guard| guard.clone())
+}
+
+#[cfg(test)]
+pub fn reset_global_proxy_pool_for_test() {
+    if let Ok(mut guard) = GLOBAL_PROXY_POOL.write() {
+        *guard = None;
+    }
 }
 
 /// 初始化全局代理池管理器（可等待，保证配置与绑定同步完成后返回）
 pub async fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<ProxyPoolManager> {
     let _init_guard = PROXY_POOL_INIT_MUTEX.lock().await;
 
-    if let Some(existing) = GLOBAL_PROXY_POOL.get() {
+    let existing_opt = GLOBAL_PROXY_POOL.read().ok().and_then(|g| g.clone());
+    if let Some(existing) = existing_opt {
         if Arc::ptr_eq(&existing.config, &config) {
             existing.sync_bindings_from_config().await;
-            return existing.clone();
+            return existing;
         }
 
         let new_cfg = config.read().await.clone();
-        {
-            let mut guard = existing.config.write().await;
-            *guard = new_cfg;
-        }
-        existing.sync_bindings_from_config().await;
-        return existing.clone();
+        existing.update_config(new_cfg).await;
+        return existing;
     }
 
+    let initial_cfg = config.read().await.clone();
     let manager = Arc::new(ProxyPoolManager::new(config.clone()));
-    manager.sync_bindings_from_config().await;
-    let _ = GLOBAL_PROXY_POOL.set(manager.clone());
+    manager.update_config(initial_cfg).await;
+    if let Ok(mut guard) = GLOBAL_PROXY_POOL.write() {
+        *guard = Some(manager.clone());
+    }
     manager
 }
 
@@ -111,6 +118,18 @@ impl ProxyPoolManager {
     /// 获取底层配置 Arc，供外部共享与双向同步
     pub fn get_config_arc(&self) -> Arc<RwLock<ProxyPoolConfig>> {
         self.config.clone()
+    }
+
+    pub fn shared_config(&self) -> Arc<RwLock<ProxyPoolConfig>> {
+        self.config.clone()
+    }
+
+    pub async fn update_config(&self, new_config: ProxyPoolConfig) {
+        {
+            let mut guard = self.config.write().await;
+            *guard = new_config;
+        }
+        self.sync_bindings_from_config().await;
     }
 
     /// [NEW] 为指定账号获取“最终生效”的 HttpClient
@@ -951,6 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_global_proxy_pool_reuse_and_update_config() {
+        reset_global_proxy_pool_for_test();
         let mut initial_config = ProxyPoolConfig::default();
         initial_config.enabled = false;
         let config_1 = Arc::new(RwLock::new(initial_config));
@@ -1005,6 +1025,27 @@ mod tests {
             assert!(Arc::ptr_eq(first, m), "All concurrent inits must return the same manager");
             assert!(Arc::ptr_eq(&first.get_config_arc(), &m.get_config_arc()), "All config Arcs must be identical");
         }
+    }
+
+    #[tokio::test]
+    async fn test_a5_same_arc_reinit_and_retry_path() {
+        reset_global_proxy_pool_for_test();
+        let cfg = Arc::new(RwLock::new(ProxyPoolConfig::default()));
+        let m1 = init_global_proxy_pool(cfg.clone()).await;
+
+        // 再次传入完全相同的 Arc，不应死锁且返回相同单例
+        let m2 = init_global_proxy_pool(cfg.clone()).await;
+        assert!(Arc::ptr_eq(&m1, &m2));
+        assert!(Arc::ptr_eq(&m1.shared_config(), &m2.shared_config()));
+        assert!(Arc::ptr_eq(&m1.shared_config(), &cfg));
+
+        // 模拟启动重试：再次传入配置，同步完成后返回
+        let mut retry_cfg = ProxyPoolConfig::default();
+        retry_cfg.health_check_interval = 77;
+        let retry_arc = Arc::new(RwLock::new(retry_cfg));
+        let m3 = init_global_proxy_pool(retry_arc).await;
+        assert!(Arc::ptr_eq(&m1, &m3));
+        assert_eq!(m1.shared_config().read().await.health_check_interval, 77);
     }
 }
 
