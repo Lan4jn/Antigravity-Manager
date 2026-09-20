@@ -113,6 +113,41 @@ pub struct AppState {
     pub image_scheduler: Arc<ImageScheduler>,
 }
 
+#[cfg(test)]
+impl AppState {
+    pub fn create_test_state(monitor: Arc<crate::proxy::monitor::ProxyMonitor>) -> Self {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(crate::proxy::token_manager::TokenManager::new(temp_dir.path().to_path_buf()));
+        let proxy_pool_cfg = Arc::new(tokio::sync::RwLock::new(crate::proxy::config::ProxyPoolConfig::default()));
+        let proxy_pool_manager = Arc::new(crate::proxy::proxy_pool::ProxyPoolManager::new(proxy_pool_cfg.clone()));
+        Self {
+            token_manager,
+            custom_mapping: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            request_timeout: 30,
+            thought_signature_map: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            upstream_proxy: Arc::new(tokio::sync::RwLock::new(crate::proxy::config::UpstreamProxyConfig::default())),
+            upstream: Arc::new(crate::proxy::upstream::client::UpstreamClient::new(None, Some(proxy_pool_manager.clone()))),
+            zai: Arc::new(tokio::sync::RwLock::new(crate::proxy::ZaiConfig::default())),
+            provider_rr: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            zai_vision_mcp: Arc::new(crate::proxy::zai_vision_mcp::ZaiVisionMcpState::new()),
+            monitor,
+            experimental: Arc::new(tokio::sync::RwLock::new(crate::proxy::config::ExperimentalConfig::default())),
+            debug_logging: Arc::new(tokio::sync::RwLock::new(crate::proxy::config::DebugLoggingConfig::default())),
+            switching: Arc::new(tokio::sync::RwLock::new(false)),
+            integration: crate::modules::integration::SystemManager::Headless,
+            account_service: Arc::new(crate::modules::account_service::AccountService::new(crate::modules::integration::SystemManager::Headless)),
+            security: Arc::new(tokio::sync::RwLock::new(crate::proxy::ProxySecurityConfig::from_proxy_config(&crate::proxy::config::ProxyConfig::default()))),
+            cloudflared_state: Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
+            is_running: Arc::new(tokio::sync::RwLock::new(true)),
+            port: 8080,
+            proxy_pool_state: proxy_pool_cfg,
+            proxy_pool_manager,
+            only_raw_quota_models: Arc::new(tokio::sync::RwLock::new(false)),
+            image_scheduler: build_image_scheduler(vec![], 1),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ImageAccountState {
     enabled: bool,
@@ -498,8 +533,17 @@ impl AxumServer {
 
     pub async fn set_running(&self, running: bool) {
         let mut r = self.is_running.write().await;
+        let was_running = *r;
         *r = running;
         tracing::info!("反代服务运行状态更新为: {}", running);
+
+        if running && !was_running {
+            // 从停用恢复到运行：恢复代理池健康检查巡检
+            self.proxy_pool_manager.clone().start_health_check_loop();
+        } else if !running && was_running {
+            // 停用反代服务：停止健康检查巡检
+            self.proxy_pool_manager.stop_health_check_loop().await;
+        }
     }
 
     /// 启动 Axum 服务器
@@ -535,7 +579,7 @@ impl AxumServer {
             (cfg_arc, existing)
         } else {
             let state = Arc::new(tokio::sync::RwLock::new(proxy_pool_config));
-            let manager = crate::proxy::proxy_pool::init_global_proxy_pool(state.clone());
+            let manager = crate::proxy::proxy_pool::init_global_proxy_pool(state.clone()).await;
             (state, manager)
         };
 

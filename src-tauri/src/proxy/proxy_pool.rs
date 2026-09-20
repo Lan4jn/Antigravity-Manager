@@ -13,48 +13,35 @@ use std::sync::OnceLock;
 
 /// 全局代理池管理器单例
 pub static GLOBAL_PROXY_POOL: OnceLock<Arc<ProxyPoolManager>> = OnceLock::new();
+static PROXY_POOL_INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 获取全局代理池管理器
 pub fn get_global_proxy_pool() -> Option<Arc<ProxyPoolManager>> {
     GLOBAL_PROXY_POOL.get().cloned()
 }
 
-/// 初始化全局代理池管理器
-pub fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<ProxyPoolManager> {
+/// 初始化全局代理池管理器（可等待，保证配置与绑定同步完成后返回）
+pub async fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<ProxyPoolManager> {
+    let _init_guard = PROXY_POOL_INIT_MUTEX.lock().await;
+
     if let Some(existing) = GLOBAL_PROXY_POOL.get() {
-        if let Ok(mut guard) = existing.config.try_write() {
-            if let Ok(new_cfg) = config.try_read() {
-                *guard = new_cfg.clone();
-            }
-        } else {
-            let pool_to_update = existing.clone();
-            tokio::spawn(async move {
-                let new_cfg = config.read().await.clone();
-                *pool_to_update.config.write().await = new_cfg;
-                pool_to_update.sync_bindings_from_config().await;
-            });
+        if Arc::ptr_eq(&existing.config, &config) {
+            existing.sync_bindings_from_config().await;
+            return existing.clone();
         }
+
+        let new_cfg = config.read().await.clone();
+        {
+            let mut guard = existing.config.write().await;
+            *guard = new_cfg;
+        }
+        existing.sync_bindings_from_config().await;
         return existing.clone();
     }
 
     let manager = Arc::new(ProxyPoolManager::new(config.clone()));
-    if let Err(_) = GLOBAL_PROXY_POOL.set(manager.clone()) {
-        if let Some(existing) = GLOBAL_PROXY_POOL.get() {
-            if let Ok(mut guard) = existing.config.try_write() {
-                if let Ok(new_cfg) = config.try_read() {
-                    *guard = new_cfg.clone();
-                }
-            } else {
-                let pool_to_update = existing.clone();
-                tokio::spawn(async move {
-                    let new_cfg = config.read().await.clone();
-                    *pool_to_update.config.write().await = new_cfg;
-                    pool_to_update.sync_bindings_from_config().await;
-                });
-            }
-            return existing.clone();
-        }
-    }
+    manager.sync_bindings_from_config().await;
+    let _ = GLOBAL_PROXY_POOL.set(manager.clone());
     manager
 }
 
@@ -914,26 +901,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_proxy_pool_start_stop_resume_lifecycle() {
+        let config = Arc::new(RwLock::new(ProxyPoolConfig::default()));
+        let manager = Arc::new(ProxyPoolManager::new(config));
+
+        // 1. 启动巡检
+        manager.clone().start_health_check_loop();
+        let handle1 = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+        assert!(!handle1.is_finished());
+
+        // 2. 模拟停止服务：停止巡检
+        manager.stop_health_check_loop().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handle1.is_finished());
+        {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_none());
+        }
+
+        // 3. 模拟再次启动：恢复巡检
+        manager.clone().start_health_check_loop();
+        let handle2 = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+        assert!(!handle2.is_finished());
+
+        // 再次调用 start，应当 abort 旧任务并仅保留一个新任务
+        manager.clone().start_health_check_loop();
+        let handle3 = {
+            let guard = manager.health_check_handle.lock().await;
+            assert!(guard.is_some());
+            guard.as_ref().unwrap().abort_handle()
+        };
+        // handle2 应当被中止
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handle2.is_finished());
+        assert!(!handle3.is_finished());
+
+        manager.stop_health_check_loop().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(handle3.is_finished());
+    }
+
+    #[tokio::test]
     async fn test_init_global_proxy_pool_reuse_and_update_config() {
         let mut initial_config = ProxyPoolConfig::default();
         initial_config.enabled = false;
         let config_1 = Arc::new(RwLock::new(initial_config));
 
-        let pool_1 = init_global_proxy_pool(config_1);
+        let pool_1 = init_global_proxy_pool(config_1).await;
 
         let mut updated_config = ProxyPoolConfig::default();
         updated_config.enabled = true;
         updated_config.health_check_interval = 42;
         let config_2 = Arc::new(RwLock::new(updated_config));
 
-        // 第二次初始化同一个全局代理池
-        let pool_2 = init_global_proxy_pool(config_2);
+        // 第二次初始化同一个全局代理池（可等待，无需 sleep 掩盖竞态）
+        let pool_2 = init_global_proxy_pool(config_2).await;
 
         // 应该返回同一个实例，不创建孤儿对象
         assert!(Arc::ptr_eq(&pool_1, &pool_2));
-
-        // 等待异步更新配置完成
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let current_cfg = pool_1.config.read().await;
         assert_eq!(current_cfg.enabled, true);
