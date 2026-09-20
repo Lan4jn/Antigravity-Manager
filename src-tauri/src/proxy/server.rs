@@ -525,9 +525,19 @@ impl AxumServer {
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
         let custom_mapping_state = Arc::new(tokio::sync::RwLock::new(custom_mapping));
         let proxy_state = Arc::new(tokio::sync::RwLock::new(upstream_proxy.clone()));
-        let proxy_pool_state = Arc::new(tokio::sync::RwLock::new(proxy_pool_config));
-        let proxy_pool_manager =
-            crate::proxy::proxy_pool::init_global_proxy_pool(proxy_pool_state.clone());
+        let (proxy_pool_state, proxy_pool_manager) = if let Some(existing) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+            let cfg_arc = existing.get_config_arc();
+            {
+                let mut guard = cfg_arc.write().await;
+                *guard = proxy_pool_config;
+            }
+            existing.sync_bindings_from_config().await;
+            (cfg_arc, existing)
+        } else {
+            let state = Arc::new(tokio::sync::RwLock::new(proxy_pool_config));
+            let manager = crate::proxy::proxy_pool::init_global_proxy_pool(state.clone());
+            (state, manager)
+        };
 
         // Start health check loop
         proxy_pool_manager.clone().start_health_check_loop();

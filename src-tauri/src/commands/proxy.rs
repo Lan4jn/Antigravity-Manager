@@ -302,6 +302,7 @@ pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(
     // 停止 Axum 服务器 (仅逻辑停止，不杀死进程)
     if let Some(instance) = instance_lock.take() {
         instance.token_manager.abort_background_tasks().await;
+        instance.axum_server.proxy_pool_manager.stop_health_check_loop().await;
         instance.axum_server.set_running(false).await;
         // 已移除 instance.axum_server.stop() 调用，防止杀死 Admin Server
     }

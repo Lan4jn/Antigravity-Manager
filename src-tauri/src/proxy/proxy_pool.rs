@@ -22,24 +22,36 @@ pub fn get_global_proxy_pool() -> Option<Arc<ProxyPoolManager>> {
 /// 初始化全局代理池管理器
 pub fn init_global_proxy_pool(config: Arc<RwLock<ProxyPoolConfig>>) -> Arc<ProxyPoolManager> {
     if let Some(existing) = GLOBAL_PROXY_POOL.get() {
-        let pool_to_update = existing.clone();
-        tokio::spawn(async move {
-            let new_cfg = config.read().await.clone();
-            *pool_to_update.config.write().await = new_cfg;
-            pool_to_update.sync_bindings_from_config().await;
-        });
-        return existing.clone();
-    }
-
-    let manager = Arc::new(ProxyPoolManager::new(config.clone()));
-    if let Err(_) = GLOBAL_PROXY_POOL.set(manager.clone()) {
-        if let Some(existing) = GLOBAL_PROXY_POOL.get() {
+        if let Ok(mut guard) = existing.config.try_write() {
+            if let Ok(new_cfg) = config.try_read() {
+                *guard = new_cfg.clone();
+            }
+        } else {
             let pool_to_update = existing.clone();
             tokio::spawn(async move {
                 let new_cfg = config.read().await.clone();
                 *pool_to_update.config.write().await = new_cfg;
                 pool_to_update.sync_bindings_from_config().await;
             });
+        }
+        return existing.clone();
+    }
+
+    let manager = Arc::new(ProxyPoolManager::new(config.clone()));
+    if let Err(_) = GLOBAL_PROXY_POOL.set(manager.clone()) {
+        if let Some(existing) = GLOBAL_PROXY_POOL.get() {
+            if let Ok(mut guard) = existing.config.try_write() {
+                if let Ok(new_cfg) = config.try_read() {
+                    *guard = new_cfg.clone();
+                }
+            } else {
+                let pool_to_update = existing.clone();
+                tokio::spawn(async move {
+                    let new_cfg = config.read().await.clone();
+                    *pool_to_update.config.write().await = new_cfg;
+                    pool_to_update.sync_bindings_from_config().await;
+                });
+            }
             return existing.clone();
         }
     }
@@ -107,6 +119,11 @@ impl ProxyPoolManager {
             round_robin_index: Arc::new(AtomicUsize::new(0)),
             health_check_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 获取底层配置 Arc，供外部共享与双向同步
+    pub fn get_config_arc(&self) -> Arc<RwLock<ProxyPoolConfig>> {
+        self.config.clone()
     }
 
     /// [NEW] 为指定账号获取“最终生效”的 HttpClient
@@ -921,6 +938,16 @@ mod tests {
         let current_cfg = pool_1.config.read().await;
         assert_eq!(current_cfg.enabled, true);
         assert_eq!(current_cfg.health_check_interval, 42);
+        drop(current_cfg);
+
+        // 验证 get_config_arc() 共享同一个 Arc 引用，外部直接写入立即可见
+        let cfg_arc = pool_1.get_config_arc();
+        assert!(Arc::ptr_eq(&cfg_arc, &pool_2.get_config_arc()));
+        {
+            let mut guard = cfg_arc.write().await;
+            guard.health_check_interval = 88;
+        }
+        assert_eq!(pool_1.config.read().await.health_check_interval, 88);
     }
 }
 
