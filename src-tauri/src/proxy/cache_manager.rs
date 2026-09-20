@@ -537,6 +537,7 @@ impl CacheManager {
     pub fn record_implicit_hit(&self, hash: &str) {
         if let Some(mut entry) = self.prefix_tracker.get_mut(hash) {
             entry.implicit_hit_count += 1;
+            entry.last_accessed = Instant::now();
             tracing::debug!(
                 "[CacheManager:L3-Prefix] implicit hit #{} for hash={}",
                 entry.implicit_hit_count,
@@ -549,6 +550,7 @@ impl CacheManager {
     pub fn record_explicit_hit(&self, hash: &str) {
         if let Some(mut entry) = self.prefix_tracker.get_mut(hash) {
             entry.explicit_hit_count += 1;
+            entry.last_accessed = Instant::now();
         }
     }
 
@@ -650,6 +652,11 @@ impl CacheManager {
             *s = (0, 0, 0);
         }
         tracing::info!("[CacheManager] All layers cleared");
+    }
+
+    #[cfg(test)]
+    pub fn get_prefix_last_accessed(&self, hash: &str) -> Option<Instant> {
+        self.prefix_tracker.get(hash).map(|e| e.last_accessed)
     }
 }
 
@@ -1152,5 +1159,29 @@ mod tests {
         // si_a 被访问过，因此未被访问的 si_b 比 si_a 先被淘汰
         assert_eq!(cm.lookup_si("si_b"), None);
         assert_eq!(cm.lookup_si("si_a"), Some("text_a".to_string()));
+    }
+
+    #[test]
+    fn test_prefix_tracker_implicit_and_explicit_hit_refreshes_last_accessed() {
+        let cm = CacheManager::new();
+        cm.insert_prefix(
+            "p_hit".to_string(),
+            "c_hit".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            Some(3600),
+        );
+        let t0 = cm.get_prefix_last_accessed("p_hit").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        cm.record_implicit_hit("p_hit");
+        let t1 = cm.get_prefix_last_accessed("p_hit").unwrap();
+        assert!(t1 > t0, "Implicit hit MUST refresh last_accessed");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cm.record_explicit_hit("p_hit");
+        let t2 = cm.get_prefix_last_accessed("p_hit").unwrap();
+        assert!(t2 > t1, "Explicit hit MUST refresh last_accessed");
     }
 }

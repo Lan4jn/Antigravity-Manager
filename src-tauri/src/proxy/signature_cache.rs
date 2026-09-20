@@ -340,16 +340,20 @@ impl SignatureCache {
         if let Ok(mut cache) = self.session_signatures.lock() {
             if let Some(entry) = cache.get_mut(session_id) {
                 if !entry.is_expired() {
-                    entry.touch();
-                    // Find the signature with the maximum message_count (the latest one)
-                    if let Some(sig_entry) = entry.data.values().max_by_key(|e| e.message_count) {
+                    let found = entry
+                        .data
+                        .values()
+                        .max_by_key(|e| e.message_count)
+                        .map(|e| (e.message_count, e.signature.clone()));
+                    if let Some((msg_count, sig)) = found {
+                        entry.touch();
                         tracing::debug!(
                             "[SignatureCache] Session {} (latest, msg_count={}) -> HIT (len={})",
                             session_id,
-                            sig_entry.message_count,
-                            sig_entry.signature.len()
+                            msg_count,
+                            sig.len()
                         );
-                        return Some(sig_entry.signature.clone());
+                        return Some(sig);
                     }
                 } else {
                     tracing::debug!("[SignatureCache] Session {} -> EXPIRED", session_id);
@@ -369,15 +373,16 @@ impl SignatureCache {
         if let Ok(mut cache) = self.session_signatures.lock() {
             if let Some(entry) = cache.get_mut(session_id) {
                 if !entry.is_expired() {
-                    entry.touch();
-                    if let Some(sig_entry) = entry.data.get(&message_count) {
+                    let sig = entry.data.get(&message_count).map(|e| e.signature.clone());
+                    if let Some(sig_str) = sig {
+                        entry.touch();
                         tracing::debug!(
                             "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",
                             session_id,
                             message_count,
-                            sig_entry.signature.len()
+                            sig_str.len()
                         );
-                        return Some(sig_entry.signature.clone());
+                        return Some(sig_str);
                     }
                 }
             }
@@ -476,16 +481,20 @@ impl SignatureCache {
         if let Ok(mut cache) = self.session_reasonings.lock() {
             if let Some(entry) = cache.get_mut(session_id) {
                 if !entry.is_expired() && turn_index < entry.data.len() {
-                    entry.touch();
-                    let text = &entry.data[turn_index];
-                    if !text.trim().is_empty() {
+                    let text = if !entry.data[turn_index].trim().is_empty() {
+                        Some(entry.data[turn_index].clone())
+                    } else {
+                        None
+                    };
+                    if let Some(t) = text {
+                        entry.touch();
                         tracing::debug!(
                             "[SignatureCache] Session {} (turn={}) -> Hit reasoning text cache (len: {})",
                             session_id,
                             turn_index,
-                            text.len()
+                            t.len()
                         );
-                        return Some(text.clone());
+                        return Some(t);
                     }
                 }
             }
@@ -569,6 +578,12 @@ impl SignatureCache {
             }
         }
         0
+    }
+
+    #[cfg(test)]
+    pub fn get_session_signature_last_accessed(&self, session_id: &str) -> Option<SystemTime> {
+        let cache = self.session_signatures.lock().ok()?;
+        cache.get(session_id).map(|e| e.last_accessed)
     }
 
     #[cfg(test)]
@@ -893,5 +908,19 @@ mod tests {
             "Internal reasoning capacity must be compact, but was {}",
             internal_cap
         );
+    }
+
+    #[test]
+    fn test_session_signature_turn_miss_does_not_refresh_touch() {
+        let cache = SignatureCache::new();
+        cache.cache_session_signature("sess_miss", "x".repeat(60), 1);
+        let t0 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(cache.get_session_signature_at("sess_miss", 999), None);
+        let t1 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        assert_eq!(t0, t1, "Turn miss must NOT refresh last_accessed");
+        assert!(cache.get_session_signature_at("sess_miss", 1).is_some());
+        let t2 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        assert!(t2 > t1, "Turn hit MUST refresh last_accessed");
     }
 }
