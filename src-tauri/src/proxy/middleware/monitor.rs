@@ -12,9 +12,9 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::time::Instant;
 
-const MAX_REQUEST_LOG_SIZE: usize = 10 * 1024 * 1024; // 10MB
-const MAX_RESPONSE_LOG_SIZE: usize = 2 * 1024 * 1024; // 2MB for non-streaming response logging
-const MAX_STREAM_CAPTURE_BYTES: usize = 2 * 1024 * 1024; // 2MB for stream logging capture buffer
+const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB: HTTP payload forwarding limit (not logging budget)
+const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB: HTTP payload forwarding limit (not logging budget)
+const MAX_STREAM_CAPTURE_BYTES: usize = 2 * 1024 * 1024; // 2MB: stream logging capture buffer (separate from forwarding)
 const MAX_LOGGED_FIELD_CHARS: usize = 500;
 
 async fn next_chunk_while_receiver_open<S, T>(
@@ -1113,6 +1113,141 @@ mod tests {
     #[test]
     fn test_stream_and_response_log_size_constants() {
         assert_eq!(super::MAX_STREAM_CAPTURE_BYTES, 2 * 1024 * 1024);
-        assert_eq!(super::MAX_RESPONSE_LOG_SIZE, 2 * 1024 * 1024);
+        assert_eq!(super::MAX_RESPONSE_LOG_SIZE, 100 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_middleware_large_payload_forwarding() {
+        use axum::{routing::post, Router};
+        use tower::ServiceExt;
+
+        let monitor = std::sync::Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let app_state = crate::proxy::server::AppState::create_test_state(monitor);
+
+        let app = Router::new()
+            .route(
+                "/echo",
+                post(|body: axum::body::Body| async move {
+                    let bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        axum::body::Body::from(bytes),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                super::monitor_middleware,
+            ))
+            .layer(axum::extract::DefaultBodyLimit::disable());
+
+        // 11 MiB 请求测试（复现 issue: 11 MiB 请求原先被清空为 0 字节）
+        let large_payload = vec![b'x'; 11 * 1024 * 1024];
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(large_payload.clone()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024)
+            .await
+            .unwrap();
+        // 验证正文完整转发，非 0 字节
+        assert_eq!(resp_bytes.len(), 11 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_middleware_disabled_logging_passthrough() {
+        use axum::{routing::post, Router};
+        use tower::ServiceExt;
+
+        let monitor = std::sync::Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(false); // 日志关闭场景
+        let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+
+        let app = Router::new()
+            .route(
+                "/echo",
+                post(|body: axum::body::Body| async move {
+                    let bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        axum::body::Body::from(bytes),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                super::monitor_middleware,
+            ))
+            .layer(axum::extract::DefaultBodyLimit::disable());
+
+        let payload = vec![b'y'; 3 * 1024 * 1024]; // 3 MiB
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(resp_bytes.len(), 3 * 1024 * 1024);
+
+        // 验证关闭日志时内存中无多余日志堆积
+        let logs = monitor.logs.read().await;
+        assert_eq!(logs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_middleware_large_image_response() {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+
+        let monitor = std::sync::Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+
+        let app = Router::new()
+            .route(
+                "/image",
+                get(|| async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "image/png")],
+                        axum::body::Body::from(vec![0x89; 5 * 1024 * 1024]),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                super::monitor_middleware,
+            ));
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/image")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let resp_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(resp_bytes.len(), 5 * 1024 * 1024);
     }
 }
