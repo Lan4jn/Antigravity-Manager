@@ -1039,6 +1039,23 @@ mod tests {
     }
 
     #[test]
+    fn session_signature_history_is_bounded() {
+        let cache = SignatureCache::new();
+        for message_count in 0..10_000 {
+            cache.cache_session_signature("s", "x".repeat(60), message_count);
+        }
+        {
+            let guard = cache.session_signatures.lock().unwrap();
+            let history = &guard.get("s").unwrap().data;
+            assert!(history.len() <= 256);
+            let bytes: usize = history.values().map(|v| v.signature.capacity()).sum();
+            assert!(bytes <= 1024 * 1024);
+        }
+        assert!(cache.get_session_signature_at("s", 0).is_none());
+        assert!(cache.get_session_signature_at("s", 9_999).is_some());
+    }
+
+    #[test]
     fn test_session_signature_10000_turns_dual_budget() {
         let cache = SignatureCache::new();
         // 写入 10,000 轮签名
