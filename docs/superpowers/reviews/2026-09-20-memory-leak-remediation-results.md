@@ -22,7 +22,7 @@
 | **A8** | 单会话签名 256条/1MiB 双预算与紧凑存储 | `test_session_signature_single_session_turns_and_bytes_budget`, `test_signature_compact_storage_eliminates_excess_capacity` | `cargo test --lib proxy::signature_cache::tests` | `0` | 单会话严格限制 256 轮，内部 String capacity < 1024 B；超限淘汰最早 message_count | **PASS** | 彻底根除 10 MiB capacity 泄漏；大于 1 MiB 签名直接拒绝缓存 |
 | **A9** | Reasoning 文本容量保护与消费端保全 | `test_reasoning_rejects_oversized_without_truncation`, `test_reasoning_internal_capacity_is_bounded` | `cargo test --lib proxy::signature_cache::tests` | `0` | 超出 128 KiB 直接拒绝缓存，不进行静默破坏性截断；存储紧凑化后 internal capacity < 4096 B | **PASS** | 保护 context_manager 上游历史恢复不受损坏 |
 | **A10** | 补齐真 LRU 保活单测与 Prefix Hit 刷新 | `test_session_signature_turn_miss_does_not_refresh_touch`, `test_prefix_tracker_implicit_and_explicit_hit_refreshes_last_accessed` | `cargo test --lib proxy::signature_cache && cargo test --lib proxy::cache_manager` | `0` | 单调时间推进验证：Prefix implicit/explicit hit 成功刷新时间戳；轮次 miss 保持时间戳不变 | **PASS** | 满足复审要求的所有 LRU 细化验收 |
-| **A11** | 离线环境全量回归与基线归因 | 全量执行脚本对比 | `cargo test --lib proxy:: --offline -- --test-threads=1` | `101` (8 历史失败) | 候选通过数 596（较基线 562 净增 34 项）；失败用例与基线 100% 同构，无新增失败 | **PASS** | 8 项既有失败均属外部模型目录与历史快照漂移 |
+| **A11** | 离线环境全量回归与基线归因 | 全量执行脚本对比 | `cargo test --lib proxy:: --offline -- --test-threads=1` | `101` (8 历史失败) | 候选通过数 609（较基线 562 净增 47 项，全库 656 项）；失败用例与基线 100% 同构，无新增失败 | **PASS** | 8 项既有失败均属外部模型目录与历史快照漂移 |
 
 ---
 
@@ -34,7 +34,7 @@
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **基线提交 (`0802afd`)** | 571 | 562 | 9 | 0 | 存在 1 个历史缓存测试 Bug + 8 个外部快照失败 |
 | **复审状态 (`b3efcfe`)** | 595 | 587 | 8 | 47 | 修复了基线缓存 Bug，但存在正文截断等新缺陷 |
-| **最终整改状态 (当前)** | 604 | 596 | 8 | 47 | 新增 9 项深度回归测试全绿，通过数净增 34 项 |
+| **最终整改状态 (当前)** | 617 | 609 | 8 | 47 | 新增 9 项深度回归测试全绿，通过数净增 34 项 |
 
 ### 2.2 8 项既有历史失败明细
 1. `proxy::mappers::claude::request::tests::test_claude_adaptive_global_config`
@@ -57,6 +57,6 @@
 ### 判定说明：
 1. **P1 缺陷全部攻克**：HTTP 转发与日志预算彻底解耦，正文转发保持 100% 完整；过期会话写入后重建且可读；单会话严格落地 256条/1MiB 双预算与 compact 存储；reasoning 拒绝超额且内部容量无泄漏。
 2. **P2 缺陷闭环解决**：服务启停自动联动代理池健康检查，无悬挂空转协程；代理池初始化成为可等待的确定性同步操作。
-3. **真实单测证据充分**：全模块共 64 项针对性单测 100% 通过，无常量伪断言。
+3. **真实单测证据充分**：全模块共 77 项针对性单测 100% 通过，无常量伪断言。
 4. **恪守 KISS 原则**：未引入任何重型外部 crate，全部改动紧凑内聚。
 
