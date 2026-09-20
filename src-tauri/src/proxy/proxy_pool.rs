@@ -982,5 +982,29 @@ mod tests {
         }
         assert_eq!(pool_1.config.read().await.health_check_interval, 88);
     }
+
+    #[tokio::test]
+    async fn test_concurrent_init_global_proxy_pool_canonical_arc() {
+        let mut tasks = Vec::new();
+        for i in 0..10 {
+            tasks.push(tokio::spawn(async move {
+                let mut cfg = ProxyPoolConfig::default();
+                cfg.health_check_interval = 100 + i;
+                let cfg_arc = Arc::new(RwLock::new(cfg));
+                init_global_proxy_pool(cfg_arc).await
+            }));
+        }
+
+        let mut managers = Vec::new();
+        for t in tasks {
+            managers.push(t.await.unwrap());
+        }
+
+        let first = &managers[0];
+        for m in &managers[1..] {
+            assert!(Arc::ptr_eq(first, m), "All concurrent inits must return the same manager");
+            assert!(Arc::ptr_eq(&first.get_config_arc(), &m.get_config_arc()), "All config Arcs must be identical");
+        }
+    }
 }
 
