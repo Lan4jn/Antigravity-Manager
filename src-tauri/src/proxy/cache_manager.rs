@@ -1192,7 +1192,7 @@ mod tests {
 
         let cm = Arc::new(CacheManager::new());
         let num_threads = 8;
-        let writes_per_thread = 50; // 每层总计写入 400 项，均远超各自上限 (100, 100, 200)
+        let writes_per_thread = 100; // 每层总计写入 800 项，均超出各自上限 (SI: 200, Tools: 100, Prefix: 500)
         let barrier = Arc::new(Barrier::new(num_threads));
 
         let mut handles = Vec::new();
@@ -1218,10 +1218,19 @@ mod tests {
             }));
         }
 
-        // 等待所有工作线程完成（若死锁则会在超时后暴露）
-        for h in handles {
-            h.join().expect("Worker thread panicked or deadlocked");
-        }
+        // 真实超时机制：利用 mpsc 通道在 10 秒超时内等待全部线程 join，超时即暴露死锁
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let monitor_handle = std::thread::spawn(move || {
+            for h in handles {
+                h.join().expect("Worker thread panicked");
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("Deadlock detected in concurrent DashMap writes: threads did not finish within 10s timeout!");
+        monitor_handle.join().expect("Monitor thread panicked");
 
         let stats = cm.get_layer_stats();
         assert!(
