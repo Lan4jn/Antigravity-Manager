@@ -427,10 +427,21 @@ mod tests {
             error: None,
         };
 
+        // 确保测试环境数据库与表结构初始化
+        let _ = crate::modules::proxy_db::init_db();
+
         monitor.log_request(log).await;
 
-        // 等待异步持久化写入完成
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // 轮询等待异步持久化写入完成（最多等待 5 秒，不用固定 sleep）
+        let mut db_entry = None;
+        for _ in 0..50 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&unique_id) {
+                db_entry = Some(detail);
+                break;
+            }
+        }
+        let db_detail = db_entry.expect("DB entry must be persisted within timeout");
 
         // 验证内存中保留的是截断预览
         {
@@ -441,8 +452,66 @@ mod tests {
         }
 
         // 验证从 SQLite 数据库读回的是未截断的完整正文
-        let db_detail = crate::modules::proxy_db::get_log_detail(&unique_id).expect("DB entry must exist");
         assert_eq!(db_detail.request_body.as_deref(), Some(full_req_body.as_str()));
         assert_eq!(db_detail.response_body.as_deref(), Some(full_resp_body.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_monitor_100_logs_window_capacity_bounded() {
+        let monitor = ProxyMonitor::new(100, None);
+        monitor.set_enabled(true);
+
+        for i in 0..150 {
+            let mut req = String::with_capacity(1024 * 1024);
+            req.push_str(&format!("req_{}_", i));
+            req.push_str(&"x".repeat(100_000));
+
+            let mut resp = String::with_capacity(1024 * 1024);
+            resp.push_str(&format!("resp_{}_", i));
+            resp.push_str(&"y".repeat(100_000));
+
+            let log = ProxyRequestLog {
+                id: format!("log_{}", i),
+                timestamp: i as i64,
+                method: "POST".to_string(),
+                url: "/test".to_string(),
+                status: 200,
+                duration: 10,
+                model: None,
+                mapped_model: None,
+                account_email: None,
+                client_ip: None,
+                request_body: Some(req),
+                response_body: Some(resp),
+                input_tokens: None,
+                output_tokens: None,
+                cached_tokens: None,
+                protocol: None,
+                username: None,
+                error: None,
+            };
+            monitor.log_request(log).await;
+        }
+
+        let logs = monitor.logs.read().await;
+        assert_eq!(logs.len(), 100);
+
+        let total_cap: usize = logs
+            .iter()
+            .map(|l| {
+                l.request_body.as_ref().map(|s| s.capacity()).unwrap_or(0)
+                    + l.response_body.as_ref().map(|s| s.capacity()).unwrap_or(0)
+            })
+            .sum();
+
+        // 100 logs * 2 bodies * (16KB + suffix) ≈ 3.3 MB max
+        let max_expected = 100 * 2 * (MAX_MEMORY_BODY_BYTES + 64);
+        assert!(
+            total_cap <= max_expected,
+            "Total in-memory capacity must be <= {}, but was {}",
+            max_expected,
+            total_cap
+        );
+        assert!(total_cap < 4 * 1024 * 1024);
     }
 }
