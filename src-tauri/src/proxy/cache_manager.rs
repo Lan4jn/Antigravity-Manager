@@ -42,6 +42,8 @@ struct SiCacheEntry {
     sanitized_text: String,
     /// 创建/更新时间
     timestamp: Instant,
+    /// 最近访问时间（用于 LRU 淘汰）
+    last_accessed: Instant,
     /// 命中次数
     hit_count: u64,
 }
@@ -55,6 +57,8 @@ struct ToolsCacheEntry {
     tools_json: String,
     /// 创建/更新时间
     timestamp: Instant,
+    /// 最近访问时间（用于 LRU 淘汰）
+    last_accessed: Instant,
     /// 命中次数
     hit_count: u64,
 }
@@ -74,6 +78,8 @@ struct PrefixTrackingEntry {
     created_at: Instant,
     /// 过期时间
     expires_at: Instant,
+    /// 最近访问时间（用于 LRU 淘汰）
+    last_accessed: Instant,
     /// 隐式缓存命中次数 (cachedContentTokenCount > 0)
     implicit_hit_count: u64,
     /// 显式缓存命中次数 (成功注入 cachedContent)
@@ -211,6 +217,7 @@ impl CacheManager {
             let mut hit_count = 0;
             if let Some(mut e) = self.si_cache.get_mut(raw_hash) {
                 e.hit_count += 1;
+                e.last_accessed = Instant::now();
                 hit_count = e.hit_count;
             }
             tracing::debug!(
@@ -247,9 +254,11 @@ impl CacheManager {
 
     /// 存入 Layer 1: raw → sanitized
     pub fn cache_si(&self, raw_hash: String, sanitized_text: String) {
+        let now = Instant::now();
         let entry = SiCacheEntry {
             sanitized_text,
-            timestamp: Instant::now(),
+            timestamp: now,
+            last_accessed: now,
             hit_count: 0,
         };
 
@@ -264,7 +273,7 @@ impl CacheManager {
             let before = self.si_cache.len();
             self.si_cache
                 .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
-            evict_oldest_dashmap(&self.si_cache, SI_CACHE_LIMIT, |v| v.timestamp);
+            evict_oldest_dashmap(&self.si_cache, SI_CACHE_LIMIT, |v| v.last_accessed);
             let after = self.si_cache.len();
             if before != after {
                 tracing::debug!(
@@ -311,6 +320,7 @@ impl CacheManager {
             }
             if let Some(mut e) = self.tools_cache.get_mut(raw_hash) {
                 e.hit_count += 1;
+                e.last_accessed = Instant::now();
             }
             tracing::debug!(
                 "[CacheManager:L2-Tools] HIT hash={}",
@@ -345,9 +355,11 @@ impl CacheManager {
 
     /// 存入 Layer 2: raw → processed tools JSON
     pub fn cache_tools(&self, raw_hash: String, tools_json: String) {
+        let now = Instant::now();
         let entry = ToolsCacheEntry {
             tools_json,
-            timestamp: Instant::now(),
+            timestamp: now,
+            last_accessed: now,
             hit_count: 0,
         };
 
@@ -361,7 +373,7 @@ impl CacheManager {
             let before = self.tools_cache.len();
             self.tools_cache
                 .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
-            evict_oldest_dashmap(&self.tools_cache, TOOLS_CACHE_LIMIT, |v| v.timestamp);
+            evict_oldest_dashmap(&self.tools_cache, TOOLS_CACHE_LIMIT, |v| v.last_accessed);
             let after = self.tools_cache.len();
             if before != after {
                 tracing::debug!(
@@ -421,6 +433,9 @@ impl CacheManager {
             if let Ok(mut stats) = self.prefix_stats.write() {
                 stats.1 += 1;
             }
+            if let Some(mut e) = self.prefix_tracker.get_mut(hash) {
+                e.last_accessed = Instant::now();
+            }
             if let Some(ref name) = cache_name {
                 tracing::debug!(
                     "[CacheManager:L3-Prefix] HIT hash={} cache_name={}",
@@ -475,6 +490,7 @@ impl CacheManager {
             cache_name,
             created_at: now,
             expires_at: now + Duration::from_secs(ttl),
+            last_accessed: now,
             implicit_hit_count: 0,
             explicit_hit_count: 0,
             model,
@@ -490,7 +506,7 @@ impl CacheManager {
             let before = self.prefix_tracker.len();
             let now = Instant::now();
             self.prefix_tracker.retain(|_, v| v.expires_at > now);
-            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| v.created_at);
+            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| v.last_accessed);
             let after = self.prefix_tracker.len();
             if before != after {
                 tracing::debug!(
@@ -1111,5 +1127,30 @@ mod tests {
         let newest_key = format!("prefix_{}", PREFIX_TRACKER_LIMIT - 1);
         let newest_cache_name = format!("cache_{}", PREFIX_TRACKER_LIMIT - 1);
         assert_eq!(cm.lookup_prefix(&newest_key), Some(newest_cache_name));
+    }
+
+    #[test]
+    fn test_si_cache_true_lru_access_promotes_entry() {
+        let cm = CacheManager::new();
+
+        cm.cache_si("si_a".to_string(), "text_a".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cm.cache_si("si_b".to_string(), "text_b".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 访问 si_a，更新其 last_accessed
+        assert_eq!(cm.lookup_si("si_a"), Some("text_a".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填充至超出 SI_CACHE_LIMIT (超限 1 项)
+        for i in 0..(SI_CACHE_LIMIT - 1) {
+            cm.cache_si(format!("si_fill_{}", i), format!("text_fill_{}", i));
+        }
+
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_si_entries, SI_CACHE_LIMIT);
+        // si_a 被访问过，因此未被访问的 si_b 比 si_a 先被淘汰
+        assert_eq!(cm.lookup_si("si_b"), None);
+        assert_eq!(cm.lookup_si("si_a"), Some("text_a".to_string()));
     }
 }
