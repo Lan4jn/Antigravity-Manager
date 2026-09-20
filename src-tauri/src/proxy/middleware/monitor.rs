@@ -689,13 +689,15 @@ pub async fn monitor_middleware(
                             Box::new(std::io::Cursor::new(Vec::new()))
                         } else {
                             match writer.into_inner() {
-                                Ok(temp_file) => match temp_file.reopen() {
-                                    Ok(file) => Box::new(std::io::BufReader::new(file)),
-                                    Err(e) => {
-                                        capture_error = Some(format!("Failed to reopen spill file: {}", e));
+                                Ok(mut temp_file) => {
+                                    use std::io::Seek;
+                                    if let Err(e) = temp_file.seek(std::io::SeekFrom::Start(0)) {
+                                        capture_error = Some(format!("Failed to seek spill file: {}", e));
                                         Box::new(std::io::Cursor::new(Vec::new()))
+                                    } else {
+                                        Box::new(std::io::BufReader::new(temp_file))
                                     }
-                                },
+                                }
                                 Err(e) => {
                                     capture_error = Some(format!("Failed to unwrap spill writer: {}", e));
                                     Box::new(std::io::Cursor::new(Vec::new()))
@@ -1401,8 +1403,12 @@ mod tests {
         assert_eq!(resp_bytes.len(), 5 * 1024 * 1024);
     }
 
+    static STREAM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn test_monitor_middleware_sse_large_stream_persists_full_body() {
+        let _test_guard = STREAM_TEST_LOCK.lock().await;
+        super::set_stream_failure_injection(super::StreamFailureInjection::None);
         use axum::{routing::get, Router};
         use tower::ServiceExt;
         use futures::stream;
@@ -1424,9 +1430,12 @@ mod tests {
         raw_chunks.push(axum::body::Bytes::from(tail_data));
         let chunks_arc = Arc::new(raw_chunks);
         let chunks_for_route = chunks_arc.clone();
+        let sse_path = format!("/sse_test_{}", uuid::Uuid::new_v4());
+        let sse_path_req = sse_path.clone();
+        let sse_path_find = sse_path.clone();
         let app = Router::new()
             .route(
-                "/sse_test",
+                &sse_path,
                 get(move || {
                     let chunks = chunks_for_route.clone();
                     async move {
@@ -1446,7 +1455,7 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .method("GET")
-            .uri("/sse_test")
+            .uri(&sse_path_req)
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -1460,8 +1469,8 @@ mod tests {
         let mut db_entry = None;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered("", false, 5, 0) {
-                if let Some(l) = logs.iter().find(|l| l.url == "/sse_test") {
+            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered(&sse_path_find, false, 5, 0) {
+                if let Some(l) = logs.iter().find(|l| l.url == sse_path_find) {
                     if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
                         if detail.response_body.is_some() {
                             db_entry = Some(detail);
@@ -1481,7 +1490,7 @@ mod tests {
 
         // 3. 验证内存中预览日志的容量上限与截断标识
         let mem_logs = monitor.logs.read().await;
-        let sse_log = mem_logs.iter().find(|l| l.url == "/sse_test").expect("Memory log must exist");
+        let sse_log = mem_logs.iter().find(|l| l.url == sse_path_find).expect("Memory log must exist");
         let mem_body = sse_log.response_body.as_ref().expect("Memory response_body must exist");
         assert!(mem_body.len() <= 16 * 1024 + 64);
         assert!(mem_body.capacity() <= 16 * 1024 + 64);
@@ -1490,6 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_failure_injection_does_not_break_client() {
+        let _test_guard = STREAM_TEST_LOCK.lock().await;
         use axum::{routing::get, Router};
         use tower::ServiceExt;
         use futures::stream;
@@ -1502,15 +1512,18 @@ mod tests {
         monitor.set_enabled(true);
         let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
 
-        let chunks = Arc::new(vec![
-            axum::body::Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\\n\\n"),
-            axum::body::Bytes::from("data: [DONE]\\n\\n"),
-        ]);
+        let mut raw_chunks = Vec::new();
+        for i in 0..25 {
+            let data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"part_{}_{}\"}}}}]}}\n\n", i, "X".repeat(50_000));
+            raw_chunks.push(axum::body::Bytes::from(data));
+        }
+        raw_chunks.push(axum::body::Bytes::from("data: [DONE]\n\n"));
+        let chunks = Arc::new(raw_chunks);
         let chunks_clone = chunks.clone();
 
         let app = Router::new()
             .route(
-                "/sse_fail",
+                "/sse_fail_unique",
                 get(move || {
                     let c = chunks_clone.clone();
                     async move {
@@ -1521,12 +1534,33 @@ mod tests {
             )
             .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
 
-        let req = axum::http::Request::builder().method("GET").uri("/sse_fail").body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder().method("GET").uri("/sse_fail_unique").body(axum::body::Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
-        let client_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        assert!(String::from_utf8_lossy(&client_bytes).contains("hello"));
+        let client_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&client_bytes).contains("part_0"));
+
+        // 验证 SQLite 中落盘了失败状态
+        let mut db_entry = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered("/sse_fail_unique", false, 5, 0) {
+                if let Some(l) = logs.iter().find(|l| l.url == "/sse_fail_unique") {
+                    if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
+                        db_entry = Some(detail);
+                        break;
+                    }
+                }
+            }
+        }
+        let detail = db_entry.expect("DB log must be persisted on failure");
+        let body = detail.response_body.unwrap_or_default();
+        let err = detail.error.unwrap_or_default();
+        assert!(
+            body.contains("failed") || body.contains("FAILED") || err.contains("failed") || err.contains("Simulated"),
+            "Log must record failure, got body={}, err={}", body, err
+        );
 
         super::set_stream_failure_injection(super::StreamFailureInjection::None);
     }
