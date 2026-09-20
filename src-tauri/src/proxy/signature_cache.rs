@@ -1057,4 +1057,74 @@ mod tests {
         assert!(cap <= SESSION_SIGNATURE_HISTORY_BYTES);
         assert!(cap < 100 * 1024); // 256 * ~100 bytes = ~25KB, strictly < 1MiB
     }
+
+    #[test]
+    fn test_family_cache_true_lru_access_promotes_entry() {
+        let cache = SignatureCache::new();
+        let sig_a = format!("sig_a_{}", "x".repeat(60));
+        let sig_b = format!("sig_b_{}", "x".repeat(60));
+        cache.set_thinking_family(sig_a.clone(), "family_a".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.set_thinking_family(sig_b.clone(), "family_b".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 访问 sig_a 提升其为活跃项
+        assert_eq!(cache.get_signature_family(&sig_a), Some("family_a".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填满超额 1 项
+        for i in 0..(FAMILY_CACHE_LIMIT - 1) {
+            cache.set_thinking_family(format!("sig_fill_{}_{}", i, "x".repeat(60)), format!("fam_{}", i));
+        }
+
+        assert_eq!(cache.family_cache_len(), FAMILY_CACHE_LIMIT);
+        // sig_b 未被访问，早于 sig_a 淘汰
+        assert_eq!(cache.get_signature_family(&sig_b), None);
+        assert_eq!(cache.get_signature_family(&sig_a), Some("family_a".to_string()));
+    }
+
+    #[test]
+    fn test_session_signature_true_lru_access_promotes_entry() {
+        let cache = SignatureCache::new();
+        let sig = "x".repeat(60);
+        cache.cache_session_signature("sess_lru_a", sig.clone(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.cache_session_signature("sess_lru_b", sig.clone(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 访问 sess_lru_a 提升活跃度
+        assert!(cache.get_session_signature("sess_lru_a").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填满超额 1 项
+        for i in 0..(SESSION_CACHE_LIMIT - 1) {
+            cache.cache_session_signature(&format!("sess_fill_{}", i), sig.clone(), 1);
+        }
+
+        assert_eq!(cache.session_cache_len(), SESSION_CACHE_LIMIT);
+        assert_eq!(cache.get_session_signature("sess_lru_b"), None);
+        assert!(cache.get_session_signature("sess_lru_a").is_some());
+    }
+
+    #[test]
+    fn test_session_reasoning_true_lru_access_promotes_entry() {
+        let cache = SignatureCache::new();
+        cache.append_reasoning("reas_lru_a", "reasoning a".to_string(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.append_reasoning("reas_lru_b", "reasoning b".to_string(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 访问 reas_lru_a 提升活跃度
+        assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填满超额 1 项
+        for i in 0..(SESSION_CACHE_LIMIT - 1) {
+            cache.append_reasoning(&format!("reas_fill_{}", i), format!("reasoning fill {}", i), 0);
+        }
+
+        assert_eq!(cache.reasoning_cache_len(), SESSION_CACHE_LIMIT);
+        assert_eq!(cache.get_session_reasoning("reas_lru_b", 0), None);
+        assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
+    }
 }

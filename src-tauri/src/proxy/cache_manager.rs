@@ -1184,4 +1184,56 @@ mod tests {
         let t2 = cm.get_prefix_last_accessed("p_hit").unwrap();
         assert!(t2 > t1, "Explicit hit MUST refresh last_accessed");
     }
+
+    #[tokio::test]
+    async fn test_dashmap_concurrent_writes_capacity_convergence() {
+        use std::sync::Arc;
+        let cm = Arc::new(CacheManager::new());
+
+        let mut handles = Vec::new();
+        for thread_idx in 0..10 {
+            let cm_clone = cm.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..50 {
+                    let key = format!("thread_{}_key_{}", thread_idx, i);
+                    cm_clone.cache_si(key.clone(), format!("val_{}", i));
+                    cm_clone.cache_tools(key, format!("{{\"tool\": {}}}", i));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let stats = cm.get_layer_stats();
+        // 验证并发写入完成后，容量严格收敛在上限范围内
+        assert!(stats.active_si_entries <= SI_CACHE_LIMIT, "SI cache must converge to limit");
+        assert!(stats.active_tools_entries <= TOOLS_CACHE_LIMIT, "Tools cache must converge to limit");
+    }
+
+    #[test]
+    fn test_tools_cache_true_lru_access_promotes_entry() {
+        let cm = CacheManager::new();
+
+        cm.cache_tools("tools_a".to_string(), "{}".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cm.cache_tools("tools_b".to_string(), "{}".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 访问 tools_a，使其活跃时间戳更新为最新
+        assert!(cm.lookup_tools("tools_a").is_some());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填充至超出 TOOLS_CACHE_LIMIT (超限 1 项)
+        for i in 0..(TOOLS_CACHE_LIMIT - 1) {
+            cm.cache_tools(format!("tools_fill_{}", i), "{}".to_string());
+        }
+
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_tools_entries, TOOLS_CACHE_LIMIT);
+        // tools_a 被访问过，因此未被访问的 tools_b 比 tools_a 先被淘汰
+        assert_eq!(cm.lookup_tools("tools_b"), None);
+        assert!(cm.lookup_tools("tools_a").is_some());
+    }
 }
