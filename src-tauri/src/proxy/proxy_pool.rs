@@ -757,6 +757,7 @@ impl ProxyPoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static GLOBAL_PROXY_POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use crate::proxy::config::ProxyAuth;
 
     #[test]
@@ -970,6 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_global_proxy_pool_reuse_and_update_config() {
+        let _test_guard = GLOBAL_PROXY_POOL_TEST_LOCK.lock().await;
         reset_global_proxy_pool_for_test();
         let mut initial_config = ProxyPoolConfig::default();
         initial_config.enabled = false;
@@ -1005,6 +1007,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_init_global_proxy_pool_canonical_arc() {
+        let _test_guard = GLOBAL_PROXY_POOL_TEST_LOCK.lock().await;
+        reset_global_proxy_pool_for_test();
         let mut tasks = Vec::new();
         for i in 0..10 {
             tasks.push(tokio::spawn(async move {
@@ -1029,6 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_a5_same_arc_reinit_and_retry_path() {
+        let _test_guard = GLOBAL_PROXY_POOL_TEST_LOCK.lock().await;
         reset_global_proxy_pool_for_test();
         let cfg = Arc::new(RwLock::new(ProxyPoolConfig::default()));
         let m1 = init_global_proxy_pool(cfg.clone()).await;

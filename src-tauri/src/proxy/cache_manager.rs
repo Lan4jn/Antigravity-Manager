@@ -1185,31 +1185,110 @@ mod tests {
         assert!(t2 > t1, "Explicit hit MUST refresh last_accessed");
     }
 
-    #[tokio::test]
-    async fn test_dashmap_concurrent_writes_capacity_convergence() {
-        use std::sync::Arc;
+    #[test]
+    fn test_dashmap_concurrent_writes_capacity_convergence() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
         let cm = Arc::new(CacheManager::new());
+        let num_threads = 8;
+        let writes_per_thread = 50; // 每层总计写入 400 项，均远超各自上限 (100, 100, 200)
+        let barrier = Arc::new(Barrier::new(num_threads));
 
         let mut handles = Vec::new();
-        for thread_idx in 0..10 {
+        for thread_idx in 0..num_threads {
             let cm_clone = cm.clone();
-            handles.push(tokio::spawn(async move {
-                for i in 0..50 {
-                    let key = format!("thread_{}_key_{}", thread_idx, i);
+            let barrier_clone = barrier.clone();
+            handles.push(thread::spawn(move || {
+                // 等待所有工作线程就绪后同时发起并发写入
+                barrier_clone.wait();
+                for i in 0..writes_per_thread {
+                    let key = format!("th_{}_k_{}", thread_idx, i);
                     cm_clone.cache_si(key.clone(), format!("val_{}", i));
-                    cm_clone.cache_tools(key, format!("{{\"tool\": {}}}", i));
+                    cm_clone.cache_tools(key.clone(), format!("{{\"tool\": {}}}", i));
+                    cm_clone.insert_prefix(
+                        key,
+                        format!("cache_{}", i),
+                        "si".to_string(),
+                        "tools".to_string(),
+                        "model".to_string(),
+                        Some(3600),
+                    );
                 }
             }));
         }
 
+        // 等待所有工作线程完成（若死锁则会在超时后暴露）
         for h in handles {
-            h.await.unwrap();
+            h.join().expect("Worker thread panicked or deadlocked");
         }
 
         let stats = cm.get_layer_stats();
-        // 验证并发写入完成后，容量严格收敛在上限范围内
-        assert!(stats.active_si_entries <= SI_CACHE_LIMIT, "SI cache must converge to limit");
-        assert!(stats.active_tools_entries <= TOOLS_CACHE_LIMIT, "Tools cache must converge to limit");
+        assert!(
+            stats.active_si_entries <= SI_CACHE_LIMIT,
+            "SI cache must converge: {} <= {}",
+            stats.active_si_entries,
+            SI_CACHE_LIMIT
+        );
+        assert!(
+            stats.active_tools_entries <= TOOLS_CACHE_LIMIT,
+            "Tools cache must converge: {} <= {}",
+            stats.active_tools_entries,
+            TOOLS_CACHE_LIMIT
+        );
+        assert!(
+            stats.active_prefix_entries <= PREFIX_TRACKER_LIMIT,
+            "Prefix tracker must converge: {} <= {}",
+            stats.active_prefix_entries,
+            PREFIX_TRACKER_LIMIT
+        );
+    }
+
+    #[test]
+    fn test_prefix_tracker_true_lru_access_promotes_entry() {
+        let cm = CacheManager::new();
+
+        cm.insert_prefix(
+            "p_a".to_string(),
+            "cache_a".to_string(),
+            "si_a".to_string(),
+            "tools_a".to_string(),
+            "model".to_string(),
+            Some(3600),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        cm.insert_prefix(
+            "p_b".to_string(),
+            "cache_b".to_string(),
+            "si_b".to_string(),
+            "tools_b".to_string(),
+            "model".to_string(),
+            Some(3600),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 访问 p_a (hot)，使其活跃时间戳更新为最新
+        assert_eq!(cm.lookup_prefix("p_a"), Some("cache_a".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 填充至超出 PREFIX_TRACKER_LIMIT (超限 1 项)
+        for i in 0..(PREFIX_TRACKER_LIMIT - 1) {
+            cm.insert_prefix(
+                format!("p_fill_{}", i),
+                format!("cache_fill_{}", i),
+                "si".to_string(),
+                "tools".to_string(),
+                "model".to_string(),
+                Some(3600),
+            );
+        }
+
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_prefix_entries, PREFIX_TRACKER_LIMIT);
+        // p_a 被访问过（hot），未被访问的 p_b（cold）先被淘汰
+        assert_eq!(cm.lookup_prefix("p_b"), None);
+        assert_eq!(cm.lookup_prefix("p_a"), Some("cache_a".to_string()));
     }
 
     #[test]
