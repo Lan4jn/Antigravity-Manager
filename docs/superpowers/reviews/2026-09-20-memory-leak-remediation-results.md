@@ -22,7 +22,7 @@
 | **A8** | **单会话连续 10,000 轮写入后最多 256 条；最新值可取，最旧值缺失；字节总和不超过预算。** | `session_signature_history_is_bounded` | `cargo test --lib proxy::signature_cache::tests::session_signature_history_is_bounded` | `0` | 连续写入 0..10000 轮：`history.len() <= 256`；第 0 轮缺失返回 None，第 9999 轮成功命中；保留签名 String capacity 总和为 ~25 KiB，严格 `<= 1024 * 1024` (1 MiB) | **PASS** | 超额严格优先弹出最小 message_count |
 | **A9** | **大签名触发字节淘汰；超预算单条拒绝；同轮覆盖、rewind、过期会话重建均符合 G4。** | `test_a9_rewind_and_same_turn_replacement`, `test_session_signature_single_session_turns_and_bytes_budget`, `test_expired_session_write_rebuilds_and_becomes_readable`, `test_reasoning_rejects_oversized_without_truncation` | `cargo test --lib proxy::signature_cache::tests` | `0` | 单条签名 > 1 MiB 或 reasoning > 128 KiB 直接拒绝（不破坏不截断）；同轮更长替换更短拒绝；rewind 删除未来轮次；过期会话写入重建空历史 | **PASS** | 协议完整性不受破坏 |
 | **A10** | **多会话外层上限、DashMap 并发写入后的容量收敛、任务退出及原有关联测试通过。** | `test_oversized_reasoning_does_not_create_session_or_allocate`, `test_dashmap_concurrent_writes_capacity_convergence`, `test_manager_drop_terminates_health_check_loop` | `cargo test --lib proxy::signature_cache && cargo test --lib proxy::cache_manager && cargo test --lib proxy::proxy_pool` | `0` | 2000 个超限输入 0 条入库（不破 1000 上限）；10 线程并发写入 DashMap 容量收敛至 `<= LIMIT`；Manager Drop 弱引用终止后台协程 | **PASS** | 无内存与协程泄漏 |
-| **A11** | **cargo check 与定向测试通过；整体测试失败完成同环境基线归因，修复新增失败。** | `cargo check`, `cargo test --lib proxy:: --offline -- --test-threads=1` | `cargo test --lib proxy:: --offline -- --test-threads=1` | `101` (8 基线失败) | `cargo check` 零编译错误；定向针对性测试 81 项 100% 全绿；`proxy::` 测试通过数由基线 562 项提升至 613 项（全库 660 项）；8 项失败与基线 100% 同构 | **PASS** | 8 项既有失败为历史静态快照问题 |
+| **A11** | **cargo check 与定向测试通过；整体测试失败完成同环境基线归因，修复新增失败。** | `cargo check`, `cargo test --lib proxy:: --offline -- --test-threads=1` | `cargo test --lib proxy:: --offline -- --test-threads=1` | `101` (8 基线失败) | `cargo check` 零编译错误；定向针对性测试 81 项 100% 全绿；`proxy::` 测试通过数由基线 562 项提升至 615 项（全库 662 项）；8 项失败与基线 100% 同构 | **PASS** | 8 项既有失败为历史静态快照问题 |
 
 ---
 
@@ -34,8 +34,8 @@
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **基线提交 (`0802afd`)** | 571 | 562 | 9 | 0 | 存在 1 个历史缓存测试 Bug + 8 个外部快照失败 |
 | **复审状态 (`b3efcfe`)** | 595 | 587 | 8 | 47 | 修复了基线缓存 Bug，但存在正文截断等缺陷 |
-| **当前状态 (HEAD)** | 621 | **613** | **8** | 47 | 新增 51 项针对性行为测试全绿，通过数净增 47 项 |
-| **全库完整 (`--lib`)** | 668 | **660** | **8** | 0 | 全局除 8 项既有快照失败外全部通过 |
+| **当前状态 (HEAD)** | 623 | **615** | **8** | 47 | 针对性行为测试 83 项全绿，通过数较基线净增 53 项 |
+| **全库完整 (`--lib`)** | 670 | **662** | **8** | 0 | 全局除 8 项既有快照失败外全部通过 |
 
 ### 2.2 8 项既有历史失败明细与事实归因
 1. `proxy::mappers::claude::request::tests::test_claude_adaptive_global_config`
