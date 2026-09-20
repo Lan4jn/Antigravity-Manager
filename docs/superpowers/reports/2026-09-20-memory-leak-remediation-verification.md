@@ -35,20 +35,19 @@
 
 ## 2. A1–A11 验收项逐项验证清单
 
-| 编号 | 检查项与 Spec 规范要求 | 涉及文件与修改点 | 验证证据与结果 | 状态 |
+| 编号 | 原 Spec 验收标准定义 (逐字对应) | 涉及文件与修改点 | 验证证据与结果 | 状态 |
 | :--- | :--- | :--- | :--- | :---: |
-| **A1** | 流式日志内存分配有界，超出截断，下游客户端数据流完整无损 | `src-tauri/src/proxy/middleware/monitor.rs`: `MAX_STREAM_CAPTURE_BYTES = 2MB`；`tx.send(Ok(chunk))` 原样透传 | `test_stream_and_response_log_size_constants` 通过；下游 channel 消费不受影响 | **PASS** |
-| **A2** | 区分 HTTP 正文转发与日志采样预算，避免正文被清空破坏 | `src-tauri/src/proxy/middleware/monitor.rs`: 恢复 100MB 转发上限；正文完整透传，避免超限截断为 0 字节 | `test_monitor_middleware_large_payload_forwarding` 实测 11MB 请求与 11MB 响应完整转发 | **PASS** |
-| **A3** | `ProxyMonitor::log_request` 避免对大 Body 进行深克隆再截断 | `src-tauri/src/proxy/monitor.rs`: `truncate_str_safe(&str)` 借用构造 `memory_log`，全量原始 body 存入 SQLite | `test_truncate_string_safe` 与容量截断测试通过，SQLite 读写完整 | **PASS** |
-| **A4** | `init_global_proxy_pool` 恢复共享配置引用与确定性更新 | `src-tauri/src/proxy/proxy_pool.rs`, `src-tauri/src/proxy/server.rs`: 暴露 `get_config_arc()`，awaitable 同步初始化 | `test_init_global_proxy_pool_reuse_and_update_config` 验证共享指针与修改立即可见 | **PASS** |
-| **A5** | `server.rs` 与服务停止流程显式停止代理池健康检查任务 | `src-tauri/src/commands/proxy.rs` (305行): `axum_server.proxy_pool_manager.stop_health_check_loop().await` | 停止服务时显式向 `JoinHandle` 发送 `abort()`，协程退出 | **PASS** |
-| **A5** | `server.rs` 与服务停止流程显式停止代理池健康检查任务，启停恢复单一任务 | `src-tauri/src/proxy/server.rs`: `set_running` 启停联动；`src-tauri/src/commands/proxy.rs`: `stop_health_check_loop().await` | `test_proxy_pool_start_stop_resume_lifecycle` 验证单任务恢复通过 | **PASS** |
-| **A6** | `SignatureCache`（4层）与 `CacheManager`（3层）记录最后访问时间并刷新，轮次 miss 不刷新 | `proxy/signature_cache.rs`, `proxy/cache_manager.rs`: `entry.touch()` 仅在命中时刷新；prefix 隐式/显式命中刷新 | `test_session_signature_turn_miss_does_not_refresh_touch` 与 hit 刷新测试通过 | **PASS** |
-| **A7** | 七层缓存超限淘汰依据全面改为 `last_accessed`（真 LRU） | `proxy/signature_cache.rs` 与 `proxy/cache_manager.rs`: `evict_oldest_if_needed` 与 `evict_oldest_dashmap` 按 `last_accessed` 排序 | 容量超额时严格驱逐最久未访问条目 | **PASS** |
-| **A8** | 单会话签名存储落实原 spec 256 轮与 1 MiB 紧凑存储双预算 | `proxy/signature_cache.rs`: `SESSION_SIGNATURE_HISTORY_LIMIT = 256`, `BYTES = 1024*1024`, 紧凑存储 | `test_signature_compact_storage_eliminates_excess_capacity` 实测 60B 文本紧凑化通过 | **PASS** |
-| **A9** | 单会话 reasoning 文本拒绝超额（128KB），不破坏性截断，紧凑存储 | `proxy/signature_cache.rs`: 超过 128KB 拒绝缓存保持协议完整，紧凑存储消除 10MB capacity 泄漏 | `test_reasoning_internal_capacity_is_bounded` 实测内部 capacity 紧凑通过 | **PASS** |
-| **A10** | 补齐真 LRU 访问保活单测，纠正注释与日志语义 | `proxy/signature_cache.rs`, `proxy/cache_manager.rs`: 新增 `test_*_true_lru_access_promotes_entry` | 单测实证：访问 promotion 成功保留先插入条目，淘汰后插入未访问条目 | **PASS** |
-| **A11** | 离线环境下全量回归，完成基线与候选对比与失败归因 | 执行 `cargo test --lib proxy:: --offline -- --test-threads=1` | 候选通过数由 562 增至 596（全局通过数由 609 增至 634），0 新增失败 | **PASS** |
+| **A1** | **10 MiB 正文得到合法预览，capacity 达到 G1 上限；原正文不变。** | `src-tauri/src/proxy/monitor.rs`: `truncate_str_safe` | `test_truncate_str_safe` 实测 10 MiB 输入得到 16 KiB + 后缀预览，`capacity <= 16419`，原 10 MiB 正文不变 | **PASS** |
+| **A2** | **中文/emoji 边界、空/None、恰好上限、短文本大 capacity；100 条循环替换后的正文容量总和有界。** | `src-tauri/src/proxy/monitor.rs`: `truncate_str_safe`, `test_monitor_100_logs_window_capacity_bounded` | 4 字节 Emoji 完整无乱码；空串返回空；恰好 16384 字节无后缀；10MB capacity 短文本被紧凑化；100 条总 capacity <= 3.3 MiB | **PASS** |
+| **A3** | **数据库写入和读回完整正文，测试使用隔离数据目录和唯一 ID，等待持久化完成。** | `src-tauri/src/proxy/monitor.rs`: `test_monitor_db_persists_and_reads_back_full_body` | 隔离 SQLite 异步持久化，通过 `proxy_db::get_log_detail` 读回完整 50 KiB 正文，断言与原文 100% 一致 | **PASS** |
+| **A4** | **两次初始化后 Arc 相同，返回时配置/绑定已同步；热更新各字段立即被 manager 观察。** | `src-tauri/src/proxy/proxy_pool.rs`, `src-tauri/src/proxy/server.rs`: `shared_config()`, `update_config()` | `test_init_global_proxy_pool_reuse_and_update_config` 验证 `Arc::ptr_eq` 为真，绑定已同步，修改立即可见 | **PASS** |
+| **A5** | **首次创建后的重试路径、传入同一 Arc、并发初始化、重复启动健康检查无死锁/重复任务。** | `src-tauri/src/proxy/proxy_pool.rs`: `test_a5_same_arc_reinit_and_retry_path`, `test_concurrent_init_global_proxy_pool_canonical_arc`, `test_proxy_pool_start_stop_resume_lifecycle` | 同一 Arc 传入同步返回；10 任务并发无死锁且规范 Arc 一致；启停联动恢复单一任务，无活动任务泄漏 | **PASS** |
+| **A6** | **七层缓存分别覆盖“旧 hot 被读取，cold 未读取，再插入超限”：hot 保留，cold 淘汰。** | `src-tauri/src/proxy/signature_cache.rs`, `src-tauri/src/proxy/cache_manager.rs`: 七层各自 True LRU promotion 行为测试 | 7 层分别建用例：读取 hot 后超额插入，hot 存活保留，cold 优先逐出 | **PASS** |
+| **A7** | **命中不延长 TTL；过期项及历史轮次 miss 不更新访问状态；统计及容量保持正确。** | `src-tauri/src/proxy/signature_cache.rs`, `src-tauri/src/proxy/cache_manager.rs`: 区分 TTL 与 LRU 时间戳 | 读取命中不更新 `created_at`（TTL 不变）；轮次 miss 不更新时间戳；拒绝写入不更新时间戳；Prefix 显隐命中单调推进时间戳 | **PASS** |
+| **A8** | **单会话连续 10,000 轮写入后最多 256 条；最新值可取，最旧值缺失；字节总和不超过预算。** | `src-tauri/src/proxy/signature_cache.rs`: `session_signature_history_is_bounded` | 连续写入 10,000 轮：`history.len() <= 256`；第 0 轮缺失，第 9999 轮命中；保留容量 <= 1024 * 1024 (1 MiB) | **PASS** |
+| **A9** | **大签名触发字节淘汰；超预算单条拒绝；同轮覆盖、rewind、过期会话重建均符合 G4。** | `src-tauri/src/proxy/signature_cache.rs`: `test_a9_rewind_and_same_turn_replacement` 等 | 单条超 1 MiB 拒绝；同轮更长覆盖更短拒绝；rewind 删除未来轮次；过期会话写入重建空历史 | **PASS** |
+| **A10** | **多会话外层上限、DashMap 并发写入后的容量收敛、任务退出及原有关联测试通过。** | `src-tauri/src/proxy/signature_cache.rs`, `src-tauri/src/proxy/cache_manager.rs`: `test_oversized_reasoning_does_not_create_session_or_allocate`, `test_dashmap_concurrent_writes_capacity_convergence` | 2000 超限输入 0 条入库（不破 1000 上限）；10 线程并发写入容量收敛至 `<= LIMIT`；Manager Drop 终止协程 | **PASS** |
+| **A11** | **cargo check 与定向测试通过；整体测试失败完成同环境基线归因，修复新增失败。** | `cargo check`, `cargo test --lib proxy:: --offline -- --test-threads=1` | `cargo check` 零编译错误；定向测试 77 项全绿；`proxy::` 测试由基线 562 项增至 609 项（全库 656 项）；8 项失败 100% 属于基线快照漂移 | **PASS** |
 
 ---
 
@@ -60,7 +59,7 @@
 
 ### 3.2 测试数据比对统计
 
-| 测试集 | 基线分支 (`0802afd`) | 候选最新状态 (`e24f6cf`) | 差异与归因 |
+| 测试集 | 基线分支 (`0802afd`) | 候选最新状态 (`1242791`) | 差异与归因 |
 | :--- | :---: | :---: | :--- |
 | `proxy::` 模块整体 | 562 通过，**9 失败** | **587 通过**，**8 失败** | **+25 通过**，**修复 1 项基线已有失败**，**0 新增失败** |
 | `lib` 全量模块 | 609 通过，**9 失败** | **634 通过**，**8 失败** | **+25 通过**，全工程无任何退化 |
