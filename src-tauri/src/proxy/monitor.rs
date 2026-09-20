@@ -396,4 +396,53 @@ mod tests {
             assert_eq!(logs[1].id, "2");
         }
     }
+
+    #[tokio::test]
+    async fn test_monitor_db_persists_and_reads_back_full_body() {
+        let monitor = ProxyMonitor::new(10, None);
+        monitor.set_enabled(true);
+
+        let unique_id = format!("test_db_full_{}", uuid::Uuid::new_v4());
+        let full_req_body = "REQ_DATA_".repeat(5000); // 45KB
+        let full_resp_body = "RESP_DATA_".repeat(6000); // 60KB
+
+        let log = ProxyRequestLog {
+            id: unique_id.clone(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            method: "POST".to_string(),
+            url: "/v1/chat/completions".to_string(),
+            status: 200,
+            duration: 120,
+            model: Some("claude-3-5-sonnet".to_string()),
+            mapped_model: Some("claude-3-5-sonnet".to_string()),
+            account_email: None,
+            client_ip: None,
+            request_body: Some(full_req_body.clone()),
+            response_body: Some(full_resp_body.clone()),
+            input_tokens: Some(100),
+            output_tokens: Some(200),
+            cached_tokens: None,
+            protocol: Some("claude".to_string()),
+            username: None,
+            error: None,
+        };
+
+        monitor.log_request(log).await;
+
+        // 等待异步持久化写入完成
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // 验证内存中保留的是截断预览
+        {
+            let logs = monitor.logs.read().await;
+            let mem_entry = logs.iter().find(|l| l.id == unique_id).expect("Memory entry must exist");
+            assert!(mem_entry.request_body.as_ref().unwrap().contains("[TRUNCATED"));
+            assert!(mem_entry.response_body.as_ref().unwrap().contains("[TRUNCATED"));
+        }
+
+        // 验证从 SQLite 数据库读回的是未截断的完整正文
+        let db_detail = crate::modules::proxy_db::get_log_detail(&unique_id).expect("DB entry must exist");
+        assert_eq!(db_detail.request_body.as_deref(), Some(full_req_body.as_str()));
+        assert_eq!(db_detail.response_body.as_deref(), Some(full_resp_body.as_str()));
+    }
 }
