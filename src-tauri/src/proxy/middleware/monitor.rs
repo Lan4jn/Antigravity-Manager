@@ -12,8 +12,9 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::time::Instant;
 
-const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
-const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
+const MAX_REQUEST_LOG_SIZE: usize = 10 * 1024 * 1024; // 10MB
+const MAX_RESPONSE_LOG_SIZE: usize = 2 * 1024 * 1024; // 2MB for non-streaming response logging
+const MAX_STREAM_CAPTURE_BYTES: usize = 2 * 1024 * 1024; // 2MB for stream logging capture buffer
 const MAX_LOGGED_FIELD_CHARS: usize = 500;
 
 async fn next_chunk_while_receiver_open<S, T>(
@@ -535,10 +536,21 @@ pub async fn monitor_middleware(
         tokio::spawn(async move {
             let mut all_stream_data = Vec::new();
             let mut last_few_bytes = Vec::new();
+            let mut stream_truncated = false;
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
-                    all_stream_data.extend_from_slice(&chunk);
+                    if all_stream_data.len() < MAX_STREAM_CAPTURE_BYTES {
+                        let available = MAX_STREAM_CAPTURE_BYTES - all_stream_data.len();
+                        if chunk.len() <= available {
+                            all_stream_data.extend_from_slice(&chunk);
+                        } else {
+                            all_stream_data.extend_from_slice(&chunk[..available]);
+                            stream_truncated = true;
+                        }
+                    } else {
+                        stream_truncated = true;
+                    }
 
                     if chunk.len() > 8192 {
                         last_few_bytes = chunk.slice(chunk.len() - 8192..).to_vec();
@@ -897,8 +909,15 @@ pub async fn monitor_middleware(
 
                 if consolidated.is_empty() {
                     // Fallback: store raw SSE data if parsing failed
-                    log.response_body = Some(full_response.to_string());
+                    let mut body = full_response.to_string();
+                    if stream_truncated {
+                        body.push_str("\n... [STREAM TRUNCATED FOR LOGGING]");
+                    }
+                    log.response_body = Some(body);
                 } else {
+                    if stream_truncated {
+                        consolidated.insert("stream_truncated".to_string(), Value::Bool(true));
+                    }
                     log.response_body = Some(
                         serde_json::to_string_pretty(&Value::Object(consolidated))
                             .unwrap_or_else(|_| full_response.to_string()),
@@ -1089,5 +1108,11 @@ mod tests {
             .expect("forwarder did not stop after receiver closed")
             .expect("forwarder task panicked");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_stream_and_response_log_size_constants() {
+        assert_eq!(super::MAX_STREAM_CAPTURE_BYTES, 2 * 1024 * 1024);
+        assert_eq!(super::MAX_RESPONSE_LOG_SIZE, 2 * 1024 * 1024);
     }
 }

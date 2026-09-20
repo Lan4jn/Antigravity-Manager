@@ -36,14 +36,18 @@ pub struct ProxyStats {
 /// 常驻内存的请求/响应体最大字节数（16KB），超出则截断，防止大 prompt/response 膨胀撑爆内存
 const MAX_MEMORY_BODY_BYTES: usize = 16 * 1024;
 
-fn truncate_string_safe(s: &mut String, max_bytes: usize) {
-    if s.len() > max_bytes {
+fn truncate_str_safe(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        s.to_string()
+    } else {
         let mut truncate_at = max_bytes;
         while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
             truncate_at -= 1;
         }
-        s.truncate(truncate_at);
-        s.push_str("... [TRUNCATED FOR IN-MEMORY CACHE]");
+        let mut out = String::with_capacity(truncate_at + 35);
+        out.push_str(&s[..truncate_at]);
+        out.push_str("... [TRUNCATED FOR IN-MEMORY CACHE]");
+        out
     }
 }
 
@@ -158,13 +162,32 @@ impl ProxyMonitor {
 
         // Add log to memory (with truncation for memory efficiency)
         {
-            let mut memory_log = log.clone();
-            if let Some(req) = &mut memory_log.request_body {
-                truncate_string_safe(req, MAX_MEMORY_BODY_BYTES);
-            }
-            if let Some(resp) = &mut memory_log.response_body {
-                truncate_string_safe(resp, MAX_MEMORY_BODY_BYTES);
-            }
+            let memory_log = ProxyRequestLog {
+                id: log.id.clone(),
+                timestamp: log.timestamp,
+                method: log.method.clone(),
+                url: log.url.clone(),
+                status: log.status,
+                duration: log.duration,
+                model: log.model.clone(),
+                mapped_model: log.mapped_model.clone(),
+                account_email: log.account_email.clone(),
+                client_ip: log.client_ip.clone(),
+                error: log.error.clone(),
+                request_body: log
+                    .request_body
+                    .as_deref()
+                    .map(|s| truncate_str_safe(s, MAX_MEMORY_BODY_BYTES)),
+                response_body: log
+                    .response_body
+                    .as_deref()
+                    .map(|s| truncate_str_safe(s, MAX_MEMORY_BODY_BYTES)),
+                input_tokens: log.input_tokens,
+                output_tokens: log.output_tokens,
+                cached_tokens: log.cached_tokens,
+                protocol: log.protocol.clone(),
+                username: log.username.clone(),
+            };
 
             let mut logs = self.logs.write().await;
             if logs.len() >= self.max_logs {
@@ -308,21 +331,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_string_safe() {
-        let mut short_str = "hello world".to_string();
-        truncate_string_safe(&mut short_str, 20);
-        assert_eq!(short_str, "hello world");
+    fn test_truncate_str_safe() {
+        let short_str = "hello world";
+        assert_eq!(truncate_str_safe(short_str, 20), "hello world");
 
         // 中文字符多字节截断保护（每个汉字3字节）
-        let mut chinese_str = "这是一段测试中文文本，用于验证多字节截断安全".to_string();
-        truncate_string_safe(&mut chinese_str, 10);
-        assert!(chinese_str.ends_with("... [TRUNCATED FOR IN-MEMORY CACHE]"));
+        let chinese_str = "这是一段测试中文文本，用于验证多字节截断安全";
+        let truncated_cn = truncate_str_safe(chinese_str, 10);
+        assert!(truncated_cn.ends_with("... [TRUNCATED FOR IN-MEMORY CACHE]"));
 
         // 超大文本截断
-        let mut large_str = "A".repeat(20 * 1024);
-        truncate_string_safe(&mut large_str, MAX_MEMORY_BODY_BYTES);
-        assert!(large_str.contains("... [TRUNCATED FOR IN-MEMORY CACHE]"));
-        assert!(large_str.len() <= MAX_MEMORY_BODY_BYTES + 40);
+        let large_str = "A".repeat(20 * 1024);
+        let truncated_large = truncate_str_safe(&large_str, MAX_MEMORY_BODY_BYTES);
+        assert!(truncated_large.contains("... [TRUNCATED FOR IN-MEMORY CACHE]"));
+        assert!(truncated_large.len() <= MAX_MEMORY_BODY_BYTES + 40);
     }
 
     #[tokio::test]
