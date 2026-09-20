@@ -534,20 +534,43 @@ pub async fn monitor_middleware(
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
-            let mut all_stream_data = Vec::new();
+            enum StreamCaptureSink {
+                Memory(Vec<u8>),
+                Spill(std::io::BufWriter<tempfile::NamedTempFile>),
+            }
+
+            const STREAM_MEMORY_SPILL_BYTES: usize = 1024 * 1024; // 1MB 内存缓冲，超过溢出到临时文件
+            const MAX_STREAM_PERSIST_BYTES: usize = 100 * 1024 * 1024; // 100MB 磁盘流式日志安全上限
+
+            let mut sink = StreamCaptureSink::Memory(Vec::with_capacity(64 * 1024));
+            let mut total_captured = 0usize;
             let mut last_few_bytes = Vec::new();
             let mut stream_truncated = false;
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
-                    if all_stream_data.len() < MAX_STREAM_CAPTURE_BYTES {
-                        let available = MAX_STREAM_CAPTURE_BYTES - all_stream_data.len();
-                        if chunk.len() <= available {
-                            all_stream_data.extend_from_slice(&chunk);
-                        } else {
-                            all_stream_data.extend_from_slice(&chunk[..available]);
-                            stream_truncated = true;
+                    if total_captured + chunk.len() <= MAX_STREAM_PERSIST_BYTES {
+                        match &mut sink {
+                            StreamCaptureSink::Memory(buf) => {
+                                if buf.len() + chunk.len() <= STREAM_MEMORY_SPILL_BYTES {
+                                    buf.extend_from_slice(&chunk);
+                                } else {
+                                    if let Ok(mut temp) = tempfile::NamedTempFile::new() {
+                                        use std::io::Write;
+                                        let _ = temp.write_all(buf);
+                                        let _ = temp.write_all(&chunk);
+                                        sink = StreamCaptureSink::Spill(std::io::BufWriter::new(temp));
+                                    } else {
+                                        stream_truncated = true;
+                                    }
+                                }
+                            }
+                            StreamCaptureSink::Spill(writer) => {
+                                use std::io::Write;
+                                let _ = writer.write_all(&chunk);
+                            }
                         }
+                        total_captured += chunk.len();
                     } else {
                         stream_truncated = true;
                     }
@@ -571,16 +594,34 @@ pub async fn monitor_middleware(
             }
             drop(stream);
 
-            // Parse and consolidate stream data into readable format
-            if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
-                let mut thinking_content = String::new();
-                let mut response_content = String::new();
-                let mut thinking_signature = String::new();
-                let mut tool_calls: Vec<Value> = Vec::new();
-                let mut cached_tokens: Option<u32> = None;
-                let mut reasoning_tokens: Option<u32> = None;
+            // Parse and consolidate stream data into readable format using buffered reader
+            use std::io::BufRead;
+            let lines_reader: Box<dyn std::io::BufRead + Send> = match sink {
+                StreamCaptureSink::Memory(buf) => Box::new(std::io::Cursor::new(buf)),
+                StreamCaptureSink::Spill(mut writer) => {
+                    use std::io::Write;
+                    let _ = writer.flush();
+                    if let Ok(temp_file) = writer.into_inner() {
+                        if let Ok(file) = temp_file.reopen() {
+                            Box::new(std::io::BufReader::new(file))
+                        } else {
+                            Box::new(std::io::Cursor::new(Vec::new()))
+                        }
+                    } else {
+                        Box::new(std::io::Cursor::new(Vec::new()))
+                    }
+                }
+            };
 
-                for line in full_response.lines() {
+            let mut thinking_content = String::new();
+            let mut response_content = String::new();
+            let mut thinking_signature = String::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            let mut cached_tokens: Option<u32> = None;
+            let mut reasoning_tokens: Option<u32> = None;
+
+            for line_res in lines_reader.lines() {
+                let Ok(line) = line_res else { continue; };
                     if !line.starts_with("data: ") {
                         continue;
                     }
@@ -908,27 +949,16 @@ pub async fn monitor_middleware(
                 }
 
                 if consolidated.is_empty() {
-                    // Fallback: store raw SSE data if parsing failed
-                    let mut body = full_response.to_string();
-                    if stream_truncated {
-                        body.push_str("\n... [STREAM TRUNCATED FOR LOGGING]");
-                    }
-                    log.response_body = Some(body);
+                    log.response_body = Some(format!("[Stream Data: {} bytes]", total_captured));
                 } else {
                     if stream_truncated {
                         consolidated.insert("stream_truncated".to_string(), Value::Bool(true));
                     }
                     log.response_body = Some(
                         serde_json::to_string_pretty(&Value::Object(consolidated))
-                            .unwrap_or_else(|_| full_response.to_string()),
+                            .unwrap_or_else(|_| format!("[Consolidated Stream Data: {} bytes]", total_captured)),
                     );
                 }
-            } else {
-                log.response_body = Some(format!(
-                    "[Binary Stream Data: {} bytes]",
-                    all_stream_data.len()
-                ));
-            }
 
             // Fallback token extraction from tail if not already extracted
             if log.input_tokens.is_none() && log.output_tokens.is_none() {
@@ -1249,5 +1279,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp_bytes.len(), 5 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_middleware_sse_large_stream_persists_full_body() {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+        use futures::stream;
+        use std::sync::Arc;
+
+        let _ = crate::modules::proxy_db::init_db();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+
+        let marker = "_TAIL_MARKER_98765_";
+        // 构造多个 chunk，总共 > 2.5 MiB
+        let mut raw_chunks = Vec::new();
+        for i in 0..50 {
+            let data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk_{}_{}\"}}}}]}}\n\n", i, "A".repeat(50_000));
+            raw_chunks.push(axum::body::Bytes::from(data));
+        }
+        let tail_data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: [DONE]\n\n", marker);
+        raw_chunks.push(axum::body::Bytes::from(tail_data));
+        let chunks_arc = Arc::new(raw_chunks);
+        let chunks_for_route = chunks_arc.clone();
+        let app = Router::new()
+            .route(
+                "/sse_test",
+                get(move || {
+                    let chunks = chunks_for_route.clone();
+                    async move {
+                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> = (*chunks).clone().into_iter().map(Ok).collect();
+                        let stream = stream::iter(items);
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            axum::body::Body::from_stream(stream),
+                        )
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                super::monitor_middleware,
+            ));
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/sse_test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let client_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024).await.unwrap();
+        let client_str = String::from_utf8_lossy(&client_bytes);
+        assert!(client_str.contains(marker), "Client must receive tail marker");
+
+        let mut db_entry = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered("", false, 5, 0) {
+                if let Some(l) = logs.iter().find(|l| l.url == "/sse_test") {
+                    if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
+                        if detail.response_body.is_some() {
+                            db_entry = Some(detail);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let detail = db_entry.expect("DB log must be persisted");
+        let body = detail.response_body.expect("DB response_body must exist");
+        assert!(body.contains(marker), "DB persisted response_body MUST contain tail marker");
     }
 }
