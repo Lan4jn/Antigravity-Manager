@@ -11,11 +11,11 @@ const TOOL_CACHE_LIMIT: usize = 500; // Layer 1: Tool-specific signatures
 const FAMILY_CACHE_LIMIT: usize = 200; // Layer 2: Model family mappings
 const SESSION_CACHE_LIMIT: usize = 1000; // Layer 3: Session-based signatures (largest)
 
-/// 单个会话内保留的最大签名轮次数（防止长多轮对话在会话内部无界膨胀）
-const MAX_SESSION_SIGNATURE_TURNS: usize = 100;
-/// 单条签名最大允许字节数（64KB）
-const MAX_SIGNATURE_BYTES: usize = 64 * 1024;
-/// 单条 reasoning 文本最大允许字节数（128KB）
+/// 单个会话内保留的最大签名轮次数（spec G4）
+const SESSION_SIGNATURE_HISTORY_LIMIT: usize = 256;
+/// 单个会话内签名 String::capacity() 合计上限（spec G4: 1 MiB）
+const SESSION_SIGNATURE_HISTORY_BYTES: usize = 1024 * 1024;
+/// 单条 reasoning 文本最大允许字节数（128KB）；超出则拒绝缓存（不截断）
 const MAX_REASONING_BYTES: usize = 128 * 1024;
 
 /// Cache entry with timestamp for TTL
@@ -232,10 +232,10 @@ impl SignatureCache {
             return;
         }
 
-        // 单条签名过大防护（A8）
-        if signature.len() > MAX_SIGNATURE_BYTES {
+        // 单条签名过大防护：超过会话总预算则拒绝（不截断）
+        if signature.len() > SESSION_SIGNATURE_HISTORY_BYTES {
             tracing::warn!(
-                "[SignatureCache] Signature for session {} exceeds max bytes ({}), ignoring",
+                "[SignatureCache] Signature for session {} exceeds budget ({} bytes), rejecting",
                 session_id,
                 signature.len()
             );
@@ -246,6 +246,14 @@ impl SignatureCache {
             let entry = cache
                 .entry(session_id.to_string())
                 .or_insert_with(|| CacheEntry::new(HashMap::new()));
+
+            // P1-2: 写入过期会话时重建空历史，刷新 TTL
+            if entry.is_expired() {
+                let now = SystemTime::now();
+                entry.created_at = now;
+                entry.last_accessed = now;
+                entry.data.clear();
+            }
 
             // Update touch for LRU
             entry.touch();
@@ -275,26 +283,37 @@ impl SignatureCache {
             };
 
             if should_store {
-                // 单会话轮次硬上限防护（A8）：超出时剔除最早的 message_count
-                if entry.data.len() >= MAX_SESSION_SIGNATURE_TURNS {
-                    if let Some(&oldest_mc) = entry.data.keys().min() {
-                        entry.data.remove(&oldest_mc);
-                    }
-                }
+                // 紧凑存储：消除输入 String 的多余 capacity
+                let compact_sig = signature.as_str().to_owned();
 
                 tracing::debug!(
                     "[SignatureCache] Session {} (msg_count={}) -> storing signature (len={})",
                     session_id,
                     message_count,
-                    signature.len()
+                    compact_sig.len()
                 );
                 entry.data.insert(
                     message_count,
                     SessionSignatureEntry {
-                        signature,
+                        signature: compact_sig,
                         message_count,
                     },
                 );
+
+                // 双预算淘汰（spec G4）：轮次上限 + 字节上限，优先淘汰最早 message_count
+                loop {
+                    let turn_ok = entry.data.len() <= SESSION_SIGNATURE_HISTORY_LIMIT;
+                    let bytes_total: usize = entry.data.values().map(|e| e.signature.capacity()).sum();
+                    let bytes_ok = bytes_total <= SESSION_SIGNATURE_HISTORY_BYTES;
+                    if turn_ok && bytes_ok {
+                        break;
+                    }
+                    if let Some(&oldest_mc) = entry.data.keys().min() {
+                        entry.data.remove(&oldest_mc);
+                    } else {
+                        break;
+                    }
+                }
             }
 
             // Cleanup when limit is reached (Session cache has largest limit)
@@ -387,6 +406,14 @@ impl SignatureCache {
                 .entry(session_id.to_string())
                 .or_insert_with(|| CacheEntry::new(Vec::new()));
 
+            // P1-2: 写入过期会话时重建空历史，刷新 TTL
+            if entry.is_expired() {
+                let now = SystemTime::now();
+                entry.created_at = now;
+                entry.last_accessed = now;
+                entry.data.clear();
+            }
+
             // Update touch for LRU
             entry.touch();
 
@@ -394,27 +421,31 @@ impl SignatureCache {
                 entry.data.resize(turn_index + 1, String::new());
             }
 
-            // 单条 reasoning 文本长度保护（A9）
-            let mut stored_reasoning = reasoning;
-            if stored_reasoning.len() > MAX_REASONING_BYTES {
-                let mut truncate_at = MAX_REASONING_BYTES;
-                while truncate_at > 0 && !stored_reasoning.is_char_boundary(truncate_at) {
-                    truncate_at -= 1;
-                }
-                stored_reasoning.truncate(truncate_at);
+            // P1-4: 超预算 reasoning 拒绝缓存（不截断，避免协议/历史恢复问题）
+            if reasoning.len() > MAX_REASONING_BYTES {
+                tracing::warn!(
+                    "[SignatureCache] Reasoning for session {} turn {} exceeds max bytes ({} > {}), rejecting",
+                    session_id,
+                    turn_index,
+                    reasoning.len(),
+                    MAX_REASONING_BYTES
+                );
+                return;
             }
 
             // Only update if the new reasoning is longer to prevent overwriting with partial content
             let old_len = entry.data[turn_index].len();
-            if stored_reasoning.len() > old_len {
+            if reasoning.len() > old_len {
+                // 紧凑存储：消除输入 String 的多余 capacity
+                let compact_reasoning = reasoning.as_str().to_owned();
                 tracing::debug!(
                     "[SignatureCache] Session {} (turn={}) -> caching reasoning text (len: {} -> {})",
                     session_id,
                     turn_index,
                     old_len,
-                    stored_reasoning.len()
+                    compact_reasoning.len()
                 );
-                entry.data[turn_index] = stored_reasoning;
+                entry.data[turn_index] = compact_reasoning;
             }
 
             // Session cache cleanup if limit exceeded
@@ -510,6 +541,44 @@ impl SignatureCache {
     #[cfg(test)]
     pub fn reasoning_cache_len(&self) -> usize {
         self.session_reasonings.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub fn inject_session_signature_created_at(&self, session_id: &str, past_time: SystemTime) {
+        if let Ok(mut cache) = self.session_signatures.lock() {
+            if let Some(entry) = cache.get_mut(session_id) {
+                entry.created_at = past_time;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn inject_session_reasoning_created_at(&self, session_id: &str, past_time: SystemTime) {
+        if let Ok(mut cache) = self.session_reasonings.lock() {
+            if let Some(entry) = cache.get_mut(session_id) {
+                entry.created_at = past_time;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn get_session_signature_internal_capacity(&self, session_id: &str) -> usize {
+        if let Ok(cache) = self.session_signatures.lock() {
+            if let Some(entry) = cache.get(session_id) {
+                return entry.data.values().map(|e| e.signature.capacity()).sum();
+            }
+        }
+        0
+    }
+
+    #[cfg(test)]
+    pub fn get_session_reasoning_internal_capacity(&self, session_id: &str) -> usize {
+        if let Ok(cache) = self.session_reasonings.lock() {
+            if let Some(entry) = cache.get(session_id) {
+                return entry.data.iter().map(|s| s.capacity()).sum();
+            }
+        }
+        0
     }
 }
 
@@ -736,34 +805,93 @@ mod tests {
     fn test_session_signature_single_session_turns_and_bytes_budget() {
         let cache = SignatureCache::new();
 
-        // 1. 超大签名（> 64KB）应被安全拒绝
-        let huge_sig = "a".repeat(MAX_SIGNATURE_BYTES + 10);
+        // 1. 超大签名（> 1 MiB）应被安全拒绝
+        let huge_sig = "a".repeat(SESSION_SIGNATURE_HISTORY_BYTES + 10);
         cache.cache_session_signature("sess_budget", huge_sig, 1);
         assert_eq!(cache.get_session_signature("sess_budget"), None);
 
-        // 2. 正常签名多轮插入，总轮次超过 MAX_SESSION_SIGNATURE_TURNS 时应限制内部条目数
-        for turn in 1..=(MAX_SESSION_SIGNATURE_TURNS + 10) {
+        // 2. 正常签名多轮插入，总轮次超过 SESSION_SIGNATURE_HISTORY_LIMIT 时应限制内部条目数
+        for turn in 1..=(SESSION_SIGNATURE_HISTORY_LIMIT + 10) {
             let valid_sig = format!("sig_turn_{:04}_{}", turn, "x".repeat(50));
             cache.cache_session_signature("sess_budget", valid_sig, turn);
         }
 
-        // 验证内部映射大小不超过 MAX_SESSION_SIGNATURE_TURNS
+        // 验证内部映射大小不超过 SESSION_SIGNATURE_HISTORY_LIMIT
         let outer = cache.session_signatures.lock().unwrap();
         let session_entry = outer.get("sess_budget").expect("session should exist");
-        assert!(session_entry.data.len() <= MAX_SESSION_SIGNATURE_TURNS);
+        assert!(session_entry.data.len() <= SESSION_SIGNATURE_HISTORY_LIMIT);
         // 最旧的第 1 轮应该已被移除
         assert!(!session_entry.data.contains_key(&1));
         // 最新的最后一轮应该存在
-        assert!(session_entry.data.contains_key(&(MAX_SESSION_SIGNATURE_TURNS + 10)));
+        assert!(session_entry.data.contains_key(&(SESSION_SIGNATURE_HISTORY_LIMIT + 10)));
     }
 
     #[test]
-    fn test_reasoning_bytes_truncation() {
+    fn test_reasoning_rejects_oversized_without_truncation() {
         let cache = SignatureCache::new();
         let huge_reasoning = "r".repeat(MAX_REASONING_BYTES + 100);
         cache.append_reasoning("sess_trunc", huge_reasoning, 0);
 
-        let stored = cache.get_session_reasoning("sess_trunc", 0).unwrap();
-        assert!(stored.len() <= MAX_REASONING_BYTES);
+        // 超预算 reasoning 不缓存（不截断），读取返回 None
+        assert_eq!(cache.get_session_reasoning("sess_trunc", 0), None);
+    }
+
+    #[test]
+    fn test_expired_session_write_rebuilds_and_becomes_readable() {
+        let cache = SignatureCache::new();
+        let sig1 = "x".repeat(60);
+        let sig2 = "y".repeat(60);
+
+        // 1. 写入第 1 轮签名
+        cache.cache_session_signature("sess_exp", sig1, 1);
+        assert!(cache.get_session_signature("sess_exp").is_some());
+
+        // 2. 注入时间：设为 3 小时前（超过 2 小时 TTL）
+        let past = SystemTime::now() - Duration::from_secs(3 * 3600);
+        cache.inject_session_signature_created_at("sess_exp", past);
+
+        // 3. 再次写入第 2 轮新签名
+        cache.cache_session_signature("sess_exp", sig2.clone(), 2);
+
+        // 4. 断言：新写入的第 2 轮签名必须立即可读！且旧轮次 1 不得复活
+        let read = cache.get_session_signature("sess_exp");
+        assert_eq!(read, Some(sig2));
+        assert_eq!(cache.get_session_signature_at("sess_exp", 1), None);
+    }
+
+    #[test]
+    fn test_signature_compact_storage_eliminates_excess_capacity() {
+        let cache = SignatureCache::new();
+
+        // 构造一个长度仅 60 字节，但拥有 10MB capacity 的畸形 String
+        let mut huge_capacity_sig = String::with_capacity(10 * 1024 * 1024);
+        huge_capacity_sig.push_str(&"s".repeat(60));
+        assert!(huge_capacity_sig.capacity() >= 10 * 1024 * 1024);
+
+        cache.cache_session_signature("sess_cap", huge_capacity_sig, 1);
+
+        // 断言：内部存储的 capacity 必须是紧凑的，不得保留 10MB capacity
+        let internal_cap = cache.get_session_signature_internal_capacity("sess_cap");
+        assert!(
+            internal_cap < 1024,
+            "Internal capacity must be compact, but was {}",
+            internal_cap
+        );
+    }
+
+    #[test]
+    fn test_reasoning_internal_capacity_is_bounded() {
+        let cache = SignatureCache::new();
+
+        let mut huge_reasoning = String::with_capacity(10 * 1024 * 1024);
+        huge_reasoning.push_str(&"r".repeat(1000));
+        cache.append_reasoning("sess_reas_cap", huge_reasoning, 0);
+
+        let internal_cap = cache.get_session_reasoning_internal_capacity("sess_reas_cap");
+        assert!(
+            internal_cap < 4096,
+            "Internal reasoning capacity must be compact, but was {}",
+            internal_cap
+        );
     }
 }
