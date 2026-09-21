@@ -69,12 +69,30 @@ fn get_stream_failure_injection() -> StreamFailureInjection {
 }
 
 
+#[cfg(test)]
+pub static CREATED_TEMP_PATHS: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub fn get_created_temp_paths() -> Vec<std::path::PathBuf> {
+    CREATED_TEMP_PATHS.lock().clone()
+}
+
+#[cfg(test)]
+pub fn clear_created_temp_paths() {
+    CREATED_TEMP_PATHS.lock().clear();
+}
+
 fn create_named_temp_file() -> std::io::Result<tempfile::NamedTempFile> {
     #[cfg(test)]
     if get_stream_failure_injection() == StreamFailureInjection::FailCreate {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Simulated tempfile creation failure"));
     }
-    tempfile::NamedTempFile::new()
+    let file = tempfile::NamedTempFile::new()?;
+    #[cfg(test)]
+    {
+        CREATED_TEMP_PATHS.lock().push(file.path().to_path_buf());
+    }
+    Ok(file)
 }
 
 struct SpillWriter {
@@ -684,14 +702,7 @@ pub async fn monitor_middleware(
                                     buf.extend_from_slice(&chunk);
                                     bytes_captured += chunk.len();
                                 } else {
-                                    #[cfg(test)]
-                                    if fail_mode == StreamFailureInjection::FailCreate {
-                                        capture_error = Some("Simulated tempfile creation failure".to_string());
-                                        sink = StreamCaptureSink::Failed;
-                                        continue;
-                                    }
-
-                                    match tempfile::NamedTempFile::new() {
+                                    match create_named_temp_file() {
                                         Ok(mut temp) => {
                                             use std::io::Write;
                                             if let Err(e) = temp.write_all(buf).and_then(|_| temp.write_all(&chunk)) {
@@ -714,13 +725,6 @@ pub async fn monitor_middleware(
                             }
                             StreamCaptureSink::Spill(writer) => {
                                 use std::io::Write;
-                                #[cfg(test)]
-                                if fail_mode == StreamFailureInjection::FailWrite && bytes_captured > 1024 * 1024 {
-                                    capture_error = Some("Simulated disk write failure".to_string());
-                                    sink = StreamCaptureSink::Failed;
-                                    continue;
-                                }
-
                                 if let Err(e) = writer.write_all(&chunk) {
                                     capture_error = Some(format!("Failed to write chunk to spill file: {}", e));
                                     sink = StreamCaptureSink::Failed;
@@ -1125,29 +1129,40 @@ pub async fn monitor_middleware(
                 consolidated.insert("bytes_forwarded".to_string(), serde_json::json!(bytes_forwarded));
                 consolidated.insert("bytes_captured".to_string(), serde_json::json!(bytes_captured));
 
-                if let Some(ref err) = capture_error {
-                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("failed"));
-                    consolidated.insert("stream_capture_error".to_string(), serde_json::json!(err));
-                    if log.error.is_none() {
-                        log.error = Some(format!("Stream capture failed: {} (forwarded: {}, captured: {})", err, bytes_forwarded, bytes_captured));
-                    }
-                } else if client_disconnected {
-                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("client_disconnected"));
-                    if log.error.is_none() {
-                        log.error = Some(format!("Client disconnected prematurely after {} bytes forwarded (captured: {})", bytes_forwarded, bytes_captured));
-                    }
-                } else if let Some(ref uerr) = upstream_error {
-                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("upstream_error"));
+                // 1. 流终止原因 (stream_termination_reason)
+                let termination_reason = if let Some(ref uerr) = upstream_error {
                     consolidated.insert("upstream_error".to_string(), serde_json::json!(uerr));
                     if log.error.is_none() {
                         log.error = Some(format!("Upstream error during stream: {}", uerr));
                     }
+                    "upstream_error"
+                } else if client_disconnected {
+                    if log.error.is_none() {
+                        log.error = Some(format!("Client disconnected prematurely after {} bytes forwarded (captured: {})", bytes_forwarded, bytes_captured));
+                    }
+                    "client_cancelled"
                 } else if stream_truncated {
-                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("truncated"));
-                    consolidated.insert("stream_truncated".to_string(), Value::Bool(true));
+                    "truncated"
                 } else {
-                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("completed"));
-                }
+                    "normal_eof"
+                };
+                consolidated.insert("stream_termination_reason".to_string(), serde_json::json!(termination_reason));
+
+                // 2. 日志捕获状态 (stream_capture_status)
+                let capture_status = if let Some(ref err) = capture_error {
+                    consolidated.insert("stream_capture_error".to_string(), serde_json::json!(err));
+                    if log.error.is_none() {
+                        log.error = Some(format!("Stream capture failed: {} (forwarded: {}, captured: {})", err, bytes_forwarded, bytes_captured));
+                    }
+                    "failed"
+                } else if stream_truncated {
+                    "truncated"
+                } else if client_disconnected || upstream_error.is_some() {
+                    "partial"
+                } else {
+                    "completed"
+                };
+                consolidated.insert("stream_capture_status".to_string(), serde_json::json!(capture_status));
 
                 if consolidated.is_empty() {
                     if let Some(ref err) = capture_error {
@@ -1584,6 +1599,13 @@ mod tests {
         assert!(mem_body.len() <= 16 * 1024 + 64);
         assert!(mem_body.capacity() <= 16 * 1024 + 64);
         assert!(mem_body.contains("[TRUNCATED FOR IN-MEMORY CACHE]"));
+
+        // 4. 验证临时文件在正常完成后已被自动删除
+        let paths = super::get_created_temp_paths();
+        assert!(!paths.is_empty(), "Large SSE stream must create temporary spill files");
+        for p in &paths {
+            assert!(!p.exists(), "Temporary spill file at {:?} must be unlinked/deleted from disk after completion", p);
+        }
     }
 
     #[tokio::test]
@@ -1602,6 +1624,7 @@ mod tests {
             super::StreamFailureInjection::FailSeek,
             super::StreamFailureInjection::FailRead,
         ] {
+            super::clear_created_temp_paths();
             let _guard = super::FailureInjectionGuard::new(mode);
 
         let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
@@ -1678,6 +1701,17 @@ mod tests {
                 assert!(cap >= 1024 * 1024, "FailWrite must have successfully written > 1MB before failure, got {}", cap);
             }
         }
+
+        // 验证临时文件资源释放与清理
+        let paths = super::get_created_temp_paths();
+        if mode == super::StreamFailureInjection::FailCreate {
+            assert!(paths.is_empty(), "FailCreate must NOT create any spill files on disk");
+        } else {
+            assert!(!paths.is_empty(), "Mode {:?} must have created a spill file", mode);
+            for p in &paths {
+                assert!(!p.exists(), "Spill file at {:?} must be unlinked/deleted from disk under mode {:?}", p, mode);
+            }
+        }
         }
     }
 
@@ -1745,7 +1779,14 @@ mod tests {
         let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let status = db_json["stream_capture_status"].as_str().unwrap();
         assert_ne!(status, "completed", "Client disconnect must NOT be marked as completed!");
-        assert_eq!(status, "client_disconnected");
+        assert_eq!(db_json["stream_termination_reason"].as_str().unwrap(), "client_cancelled");
+        assert_eq!(status, "partial");
+
+        // 验证客户端断开后临时文件已被自动删除
+        let paths = super::get_created_temp_paths();
+        for p in &paths {
+            assert!(!p.exists(), "Temporary spill file must be unlinked/deleted from disk after client disconnect");
+        }
     }
 
 
@@ -1807,7 +1848,14 @@ mod tests {
         let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let status = db_json["stream_capture_status"].as_str().unwrap();
         assert_ne!(status, "completed", "Upstream error must NOT be marked as completed!");
-        assert_eq!(status, "upstream_error");
+        assert_eq!(db_json["stream_termination_reason"].as_str().unwrap(), "upstream_error");
+        assert_eq!(status, "partial");
+
+        // 验证上游错误后临时文件已被自动删除
+        let paths = super::get_created_temp_paths();
+        for p in &paths {
+            assert!(!p.exists(), "Temporary spill file must be unlinked/deleted from disk after upstream error");
+        }
     }
 
 }
