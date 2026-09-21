@@ -69,6 +69,61 @@ fn get_stream_failure_injection() -> StreamFailureInjection {
 }
 
 
+fn create_named_temp_file() -> std::io::Result<tempfile::NamedTempFile> {
+    #[cfg(test)]
+    if get_stream_failure_injection() == StreamFailureInjection::FailCreate {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Simulated tempfile creation failure"));
+    }
+    tempfile::NamedTempFile::new()
+}
+
+struct SpillWriter {
+    inner: std::io::BufWriter<tempfile::NamedTempFile>,
+    bytes_written: usize,
+}
+
+impl std::io::Write for SpillWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if get_stream_failure_injection() == StreamFailureInjection::FailWrite && self.bytes_written > 1024 * 1024 {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Simulated disk write failure"));
+        }
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if get_stream_failure_injection() == StreamFailureInjection::FailFlush {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Simulated flush failure"));
+        }
+        self.inner.flush()
+    }
+}
+
+fn seek_and_open_reader(mut temp_file: tempfile::NamedTempFile) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
+    #[cfg(test)]
+    if get_stream_failure_injection() == StreamFailureInjection::FailSeek {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Simulated seek failure"));
+    }
+    use std::io::Seek;
+    temp_file.seek(std::io::SeekFrom::Start(0))?;
+
+    #[cfg(test)]
+    if get_stream_failure_injection() == StreamFailureInjection::FailRead {
+        struct FailingRead(tempfile::NamedTempFile);
+        impl std::io::Read for FailingRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Simulated read failure mid-stream"))
+            }
+        }
+        return Ok(Box::new(std::io::BufReader::new(FailingRead(temp_file))));
+    }
+
+    Ok(Box::new(std::io::BufReader::new(temp_file)))
+}
+
 const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB: HTTP payload forwarding limit (not logging budget)
 const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB: HTTP payload forwarding limit (not logging budget)
 const MAX_STREAM_CAPTURE_BYTES: usize = 2 * 1024 * 1024; // 2MB: stream logging capture buffer (separate from forwarding)
@@ -593,7 +648,7 @@ pub async fn monitor_middleware(
         tokio::spawn(async move {
             enum StreamCaptureSink {
                 Memory(Vec<u8>),
-                Spill(std::io::BufWriter<tempfile::NamedTempFile>),
+                Spill(SpillWriter),
                 Failed,
             }
 
@@ -644,7 +699,10 @@ pub async fn monitor_middleware(
                                                 sink = StreamCaptureSink::Failed;
                                             } else {
                                                 bytes_captured += chunk.len();
-                                                sink = StreamCaptureSink::Spill(std::io::BufWriter::new(temp));
+                                                sink = StreamCaptureSink::Spill(SpillWriter {
+                                                    inner: std::io::BufWriter::new(temp),
+                                                    bytes_written: buf.len() + chunk.len(),
+                                                });
                                             }
                                         }
                                         Err(e) => {
@@ -690,7 +748,7 @@ pub async fn monitor_middleware(
                     break;
                 }
             }
-            if tx.is_closed() {
+            if upstream_error.is_none() && tx.is_closed() {
                 client_disconnected = true;
             }
             drop(stream);
@@ -701,38 +759,23 @@ pub async fn monitor_middleware(
                 StreamCaptureSink::Memory(buf) => Box::new(std::io::Cursor::new(buf)),
                 StreamCaptureSink::Spill(mut writer) => {
                     use std::io::Write;
-                    #[cfg(test)]
-                    if fail_mode == StreamFailureInjection::FailFlush {
-                        capture_error = Some("Simulated flush failure".to_string());
-                    }
-                    #[cfg(test)]
-                    if fail_mode == StreamFailureInjection::FailSeek {
-                        capture_error = Some("Simulated seek failure".to_string());
-                    }
-
-                    if capture_error.is_none() {
-                        if let Err(e) = writer.flush() {
-                            capture_error = Some(format!("Failed to flush spill file: {}", e));
-                            Box::new(std::io::Cursor::new(Vec::new()))
-                        } else {
-                            match writer.into_inner() {
-                                Ok(mut temp_file) => {
-                                    use std::io::Seek;
-                                    if let Err(e) = temp_file.seek(std::io::SeekFrom::Start(0)) {
-                                        capture_error = Some(format!("Failed to seek spill file: {}", e));
-                                        Box::new(std::io::Cursor::new(Vec::new()))
-                                    } else {
-                                        Box::new(std::io::BufReader::new(temp_file))
-                                    }
-                                }
+                    if let Err(e) = writer.flush() {
+                        capture_error = Some(format!("Failed to flush spill file: {}", e));
+                        Box::new(std::io::Cursor::new(Vec::new()))
+                    } else {
+                        match writer.inner.into_inner() {
+                            Ok(temp_file) => match seek_and_open_reader(temp_file) {
+                                Ok(reader) => reader,
                                 Err(e) => {
-                                    capture_error = Some(format!("Failed to unwrap spill writer: {}", e));
+                                    capture_error = Some(format!("Failed to seek spill file: {}", e));
                                     Box::new(std::io::Cursor::new(Vec::new()))
                                 }
+                            },
+                            Err(e) => {
+                                capture_error = Some(format!("Failed to unwrap spill writer: {}", e));
+                                Box::new(std::io::Cursor::new(Vec::new()))
                             }
                         }
-                    } else {
-                        Box::new(std::io::Cursor::new(Vec::new()))
                     }
                 }
                 StreamCaptureSink::Failed => Box::new(std::io::Cursor::new(Vec::new())),
@@ -753,11 +796,6 @@ pub async fn monitor_middleware(
                         break;
                     }
                 };
-                #[cfg(test)]
-                if fail_mode == StreamFailureInjection::FailRead && !response_content.is_empty() {
-                    capture_error = Some("Simulated read failure mid-stream".to_string());
-                    break;
-                }
                     if !line.starts_with("data: ") {
                         continue;
                     }
@@ -1600,9 +1638,16 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         let client_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await.unwrap();
-        assert!(String::from_utf8_lossy(&client_bytes).contains("part_0"));
+        // 逐字节完整比对，彻底替换仅检查 part_0 的方式
+        let expected_client_bytes: Vec<u8> = (*chunks).iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(
+            client_bytes.to_vec(),
+            expected_client_bytes,
+            "Client must receive 100% stream bytes byte-for-byte under failure mode {:?}",
+            mode
+        );
 
-        // 验证 SQLite 中落盘了失败状态
+        // 验证 SQLite 中落盘了失败状态并检查准确计数
         let mut db_entry = None;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1622,6 +1667,17 @@ mod tests {
             body.contains("failed") || body.contains("FAILED") || err.contains("failed") || err.contains("Simulated"),
             "Log must record failure for mode {:?}, got body={}, err={}", mode, body, err
         );
+
+        // 如果是中途写入失败，验证准确计数（部分成功写入之后捕获停止，但转发持续到末尾）
+        if mode == super::StreamFailureInjection::FailWrite {
+            if let Ok(db_json) = serde_json::from_str::<serde_json::Value>(&body) {
+                let fwd = db_json["bytes_forwarded"].as_u64().unwrap_or(0) as usize;
+                let cap = db_json["bytes_captured"].as_u64().unwrap_or(0) as usize;
+                assert_eq!(fwd, expected_client_bytes.len(), "Forwarded bytes must equal client bytes");
+                assert!(cap < fwd, "Captured bytes must be strictly less than forwarded on FailWrite: {} < {}", cap, fwd);
+                assert!(cap >= 1024 * 1024, "FailWrite must have successfully written > 1MB before failure, got {}", cap);
+            }
+        }
         }
     }
 
