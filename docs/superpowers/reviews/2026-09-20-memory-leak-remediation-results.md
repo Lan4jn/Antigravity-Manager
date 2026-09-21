@@ -3,7 +3,7 @@
 **生成日期**：2026-09-20  
 **验证分支**：`fix/memory-leaks`  
 **基线提交 (Base)**：`0802afd`  
-**复审修复提交**：`577e10c` (工作区最新状态)  
+**复审修复提交**：`215d89d` (工作区最新状态)  
 **测试数据目录**：`/tmp/antigravity-remediation-run/candidate-data` (隔离环境)  
 
 ---
