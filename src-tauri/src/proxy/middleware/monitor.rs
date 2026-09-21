@@ -18,8 +18,26 @@ pub enum StreamFailureInjection {
     FailCreate,
     FailWrite,
     FailFlush,
-    FailReopen,
+    FailSeek,
     FailRead,
+}
+
+#[cfg(test)]
+pub struct FailureInjectionGuard(StreamFailureInjection);
+
+#[cfg(test)]
+impl FailureInjectionGuard {
+    pub fn new(mode: StreamFailureInjection) -> Self {
+        set_stream_failure_injection(mode);
+        Self(mode)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailureInjectionGuard {
+    fn drop(&mut self) {
+        set_stream_failure_injection(StreamFailureInjection::None);
+    }
 }
 
 #[cfg(test)]
@@ -32,7 +50,7 @@ pub fn set_stream_failure_injection(mode: StreamFailureInjection) {
         StreamFailureInjection::FailCreate => 1,
         StreamFailureInjection::FailWrite => 2,
         StreamFailureInjection::FailFlush => 3,
-        StreamFailureInjection::FailReopen => 4,
+        StreamFailureInjection::FailSeek => 4,
         StreamFailureInjection::FailRead => 5,
     };
     STREAM_FAILURE_INJECTION.store(val, std::sync::atomic::Ordering::SeqCst);
@@ -44,7 +62,7 @@ fn get_stream_failure_injection() -> StreamFailureInjection {
         1 => StreamFailureInjection::FailCreate,
         2 => StreamFailureInjection::FailWrite,
         3 => StreamFailureInjection::FailFlush,
-        4 => StreamFailureInjection::FailReopen,
+        4 => StreamFailureInjection::FailSeek,
         5 => StreamFailureInjection::FailRead,
         _ => StreamFailureInjection::None,
     }
@@ -583,7 +601,8 @@ pub async fn monitor_middleware(
             const MAX_STREAM_PERSIST_BYTES: usize = 100 * 1024 * 1024; // 100MB 磁盘流式日志安全上限
 
             let mut sink = StreamCaptureSink::Memory(Vec::with_capacity(64 * 1024));
-            let mut total_captured = 0usize;
+            let mut bytes_forwarded = 0usize;
+            let mut bytes_captured = 0usize;
             let mut last_few_bytes = Vec::new();
             let mut stream_truncated = false;
             let mut capture_error: Option<String> = None;
@@ -597,19 +616,20 @@ pub async fn monitor_middleware(
                     if tx.send(Ok::<_, axum::Error>(chunk.clone())).await.is_err() {
                         break;
                     }
+                    bytes_forwarded += chunk.len();
 
                     // 2. 捕获并落盘
-                    if capture_error.is_none() && total_captured + chunk.len() <= MAX_STREAM_PERSIST_BYTES {
+                    if capture_error.is_none() && bytes_captured + chunk.len() <= MAX_STREAM_PERSIST_BYTES {
                         match &mut sink {
                             StreamCaptureSink::Memory(buf) => {
                                 if buf.len() + chunk.len() <= STREAM_MEMORY_SPILL_BYTES {
                                     buf.extend_from_slice(&chunk);
+                                    bytes_captured += chunk.len();
                                 } else {
                                     #[cfg(test)]
                                     if fail_mode == StreamFailureInjection::FailCreate {
                                         capture_error = Some("Simulated tempfile creation failure".to_string());
                                         sink = StreamCaptureSink::Failed;
-                                        total_captured += chunk.len();
                                         continue;
                                     }
 
@@ -620,6 +640,7 @@ pub async fn monitor_middleware(
                                                 capture_error = Some(format!("Failed to write initial chunks to spill file: {}", e));
                                                 sink = StreamCaptureSink::Failed;
                                             } else {
+                                                bytes_captured += chunk.len();
                                                 sink = StreamCaptureSink::Spill(std::io::BufWriter::new(temp));
                                             }
                                         }
@@ -633,22 +654,22 @@ pub async fn monitor_middleware(
                             StreamCaptureSink::Spill(writer) => {
                                 use std::io::Write;
                                 #[cfg(test)]
-                                if fail_mode == StreamFailureInjection::FailWrite {
+                                if fail_mode == StreamFailureInjection::FailWrite && bytes_captured > 1024 * 1024 {
                                     capture_error = Some("Simulated disk write failure".to_string());
                                     sink = StreamCaptureSink::Failed;
-                                    total_captured += chunk.len();
                                     continue;
                                 }
 
                                 if let Err(e) = writer.write_all(&chunk) {
                                     capture_error = Some(format!("Failed to write chunk to spill file: {}", e));
                                     sink = StreamCaptureSink::Failed;
+                                } else {
+                                    bytes_captured += chunk.len();
                                 }
                             }
                             StreamCaptureSink::Failed => {}
                         }
-                        total_captured += chunk.len();
-                    } else if total_captured + chunk.len() > MAX_STREAM_PERSIST_BYTES {
+                    } else if bytes_captured + chunk.len() > MAX_STREAM_PERSIST_BYTES {
                         stream_truncated = true;
                     }
 
@@ -679,8 +700,8 @@ pub async fn monitor_middleware(
                         capture_error = Some("Simulated flush failure".to_string());
                     }
                     #[cfg(test)]
-                    if fail_mode == StreamFailureInjection::FailReopen {
-                        capture_error = Some("Simulated reopen failure".to_string());
+                    if fail_mode == StreamFailureInjection::FailSeek {
+                        capture_error = Some("Simulated seek failure".to_string());
                     }
 
                     if capture_error.is_none() {
@@ -1057,28 +1078,32 @@ pub async fn monitor_middleware(
                     consolidated.insert("usage".to_string(), Value::Object(usage_obj));
                 }
 
+                consolidated.insert("bytes_forwarded".to_string(), serde_json::json!(bytes_forwarded));
+                consolidated.insert("bytes_captured".to_string(), serde_json::json!(bytes_captured));
+
                 if let Some(ref err) = capture_error {
                     consolidated.insert("stream_capture_status".to_string(), serde_json::json!("failed"));
                     consolidated.insert("stream_capture_error".to_string(), serde_json::json!(err));
-                    consolidated.insert("bytes_forwarded".to_string(), serde_json::json!(total_captured));
                     if log.error.is_none() {
-                        log.error = Some(format!("Stream capture failed: {}", err));
+                        log.error = Some(format!("Stream capture failed: {} (forwarded: {}, captured: {})", err, bytes_forwarded, bytes_captured));
                     }
+                } else if stream_truncated {
+                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("truncated"));
+                    consolidated.insert("stream_truncated".to_string(), Value::Bool(true));
+                } else {
+                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("completed"));
                 }
 
                 if consolidated.is_empty() {
                     if let Some(ref err) = capture_error {
-                        log.response_body = Some(format!("[STREAM CAPTURE FAILED: {} (bytes forwarded: {})]", err, total_captured));
+                        log.response_body = Some(format!("[STREAM CAPTURE FAILED: {} (forwarded: {}, captured: {})]", err, bytes_forwarded, bytes_captured));
                     } else {
-                        log.response_body = Some(format!("[Stream Data: {} bytes]", total_captured));
+                        log.response_body = Some(format!("[Stream Data: forwarded {} bytes, captured {} bytes]", bytes_forwarded, bytes_captured));
                     }
                 } else {
-                    if stream_truncated {
-                        consolidated.insert("stream_truncated".to_string(), Value::Bool(true));
-                    }
                     log.response_body = Some(
                         serde_json::to_string_pretty(&Value::Object(consolidated))
-                            .unwrap_or_else(|_| format!("[Consolidated Stream Data: {} bytes]", total_captured)),
+                            .unwrap_or_else(|_| format!("[Consolidated Stream Data: {} bytes]", bytes_forwarded)),
                     );
                 }
 
@@ -1506,7 +1531,14 @@ mod tests {
         use std::sync::Arc;
 
         let _ = crate::modules::proxy_db::init_db();
-        super::set_stream_failure_injection(super::StreamFailureInjection::FailCreate);
+        for mode in [
+            super::StreamFailureInjection::FailCreate,
+            super::StreamFailureInjection::FailWrite,
+            super::StreamFailureInjection::FailFlush,
+            super::StreamFailureInjection::FailSeek,
+            super::StreamFailureInjection::FailRead,
+        ] {
+            let _guard = super::FailureInjectionGuard::new(mode);
 
         let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
         monitor.set_enabled(true);
@@ -1520,10 +1552,13 @@ mod tests {
         raw_chunks.push(axum::body::Bytes::from("data: [DONE]\n\n"));
         let chunks = Arc::new(raw_chunks);
         let chunks_clone = chunks.clone();
+        let fail_url = format!("/sse_fail_{:?}_{}", mode, uuid::Uuid::new_v4());
+        let fail_url_req = fail_url.clone();
+        let fail_url_find = fail_url.clone();
 
         let app = Router::new()
             .route(
-                "/sse_fail_unique",
+                &fail_url,
                 get(move || {
                     let c = chunks_clone.clone();
                     async move {
@@ -1534,7 +1569,7 @@ mod tests {
             )
             .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
 
-        let req = axum::http::Request::builder().method("GET").uri("/sse_fail_unique").body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder().method("GET").uri(&fail_url_req).body(axum::body::Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
@@ -1545,8 +1580,8 @@ mod tests {
         let mut db_entry = None;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered("/sse_fail_unique", false, 5, 0) {
-                if let Some(l) = logs.iter().find(|l| l.url == "/sse_fail_unique") {
+            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered(&fail_url_find, false, 5, 0) {
+                if let Some(l) = logs.iter().find(|l| l.url == fail_url_find) {
                     if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
                         db_entry = Some(detail);
                         break;
@@ -1559,10 +1594,9 @@ mod tests {
         let err = detail.error.unwrap_or_default();
         assert!(
             body.contains("failed") || body.contains("FAILED") || err.contains("failed") || err.contains("Simulated"),
-            "Log must record failure, got body={}, err={}", body, err
+            "Log must record failure for mode {:?}, got body={}, err={}", mode, body, err
         );
-
-        super::set_stream_failure_injection(super::StreamFailureInjection::None);
+        }
     }
 
 }
