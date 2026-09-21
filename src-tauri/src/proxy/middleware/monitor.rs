@@ -606,6 +606,8 @@ pub async fn monitor_middleware(
             let mut last_few_bytes = Vec::new();
             let mut stream_truncated = false;
             let mut capture_error: Option<String> = None;
+            let mut client_disconnected = false;
+            let mut upstream_error: Option<String> = None;
 
             #[cfg(test)]
             let fail_mode = get_stream_failure_injection();
@@ -614,6 +616,7 @@ pub async fn monitor_middleware(
                 if let Ok(chunk) = chunk_res {
                     // 1. 优先转发客户端：日志系统任何 I/O 故障绝不阻塞或截断客户端数据流
                     if tx.send(Ok::<_, axum::Error>(chunk.clone())).await.is_err() {
+                        client_disconnected = true;
                         break;
                     }
                     bytes_forwarded += chunk.len();
@@ -682,10 +685,13 @@ pub async fn monitor_middleware(
                         }
                     }
                 } else if let Err(e) = chunk_res {
-                    if tx.send(Err(axum::Error::new(e))).await.is_err() {
-                        break;
-                    }
+                    upstream_error = Some(e.to_string());
+                    let _ = tx.send(Err(axum::Error::new(e))).await;
+                    break;
                 }
+            }
+            if tx.is_closed() {
+                client_disconnected = true;
             }
             drop(stream);
 
@@ -1086,6 +1092,17 @@ pub async fn monitor_middleware(
                     consolidated.insert("stream_capture_error".to_string(), serde_json::json!(err));
                     if log.error.is_none() {
                         log.error = Some(format!("Stream capture failed: {} (forwarded: {}, captured: {})", err, bytes_forwarded, bytes_captured));
+                    }
+                } else if client_disconnected {
+                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("client_disconnected"));
+                    if log.error.is_none() {
+                        log.error = Some(format!("Client disconnected prematurely after {} bytes forwarded (captured: {})", bytes_forwarded, bytes_captured));
+                    }
+                } else if let Some(ref uerr) = upstream_error {
+                    consolidated.insert("stream_capture_status".to_string(), serde_json::json!("upstream_error"));
+                    consolidated.insert("upstream_error".to_string(), serde_json::json!(uerr));
+                    if log.error.is_none() {
+                        log.error = Some(format!("Upstream error during stream: {}", uerr));
                     }
                 } else if stream_truncated {
                     consolidated.insert("stream_capture_status".to_string(), serde_json::json!("truncated"));
@@ -1488,8 +1505,9 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         let client_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024).await.unwrap();
-        let client_str = String::from_utf8_lossy(&client_bytes);
-        assert!(client_str.contains(marker), "Client must receive tail marker");
+        // 1. 客户端完整数据逐字节比对
+        let expected_client_bytes: Vec<u8> = (*chunks_arc).iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(client_bytes.to_vec(), expected_client_bytes, "Client bytes must match expected stream byte-for-byte");
 
         let mut db_entry = None;
         for _ in 0..50 {
@@ -1507,11 +1525,19 @@ mod tests {
         }
         let detail = db_entry.expect("DB log must be persisted");
         let body = detail.response_body.expect("DB response_body must exist");
-        assert!(body.contains(marker), "DB persisted response_body MUST contain tail marker");
         let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let resp_text = db_json["content"].as_str().unwrap();
-        assert!(resp_text.contains(marker));
-        assert!(resp_text.len() > 2 * 1024 * 1024);
+
+        // 2. 数据库全文严格逐字符比对
+        let mut expected_business_content = String::new();
+        for i in 0..50 {
+            expected_business_content.push_str(&format!("chunk_{}_{}", i, "A".repeat(50_000)));
+        }
+        expected_business_content.push_str(marker);
+        assert_eq!(resp_text, &expected_business_content, "DB content must match full business text character-for-character");
+        assert_eq!(db_json["bytes_forwarded"].as_u64().unwrap() as usize, expected_client_bytes.len());
+        assert_eq!(db_json["bytes_captured"].as_u64().unwrap() as usize, expected_client_bytes.len());
+        assert_eq!(db_json["stream_capture_status"].as_str().unwrap(), "completed");
 
         // 3. 验证内存中预览日志的容量上限与截断标识
         let mem_logs = monitor.logs.read().await;
@@ -1597,6 +1623,135 @@ mod tests {
             "Log must record failure for mode {:?}, got body={}, err={}", mode, body, err
         );
         }
+    }
+
+
+    #[tokio::test]
+    async fn test_client_disconnect_marks_interrupted_not_completed() {
+        let _test_guard = STREAM_TEST_LOCK.lock().await;
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+        use futures::{stream, StreamExt};
+        use std::sync::Arc;
+
+        let _ = crate::modules::proxy_db::init_db();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+
+        let url = format!("/sse_disconnect_{}", uuid::Uuid::new_v4());
+        let url_req = url.clone();
+        let url_find = url.clone();
+
+        let chunks: Vec<axum::body::Bytes> = (0..100)
+            .map(|i| axum::body::Bytes::from(format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk_{}\"}}}}]}}\n\n", i)))
+            .collect();
+        let chunks_arc = Arc::new(chunks);
+
+        let app = Router::new()
+            .route(
+                &url,
+                get(move || {
+                    let c = chunks_arc.clone();
+                    async move {
+                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> = (*c).clone().into_iter().map(Ok).collect();
+                        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream::iter(items)))
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
+
+        let req = axum::http::Request::builder().method("GET").uri(&url_req).body(axum::body::Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        let first = body_stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("chunk_0"));
+        drop(body_stream); // 客户端主动断开
+
+        let mut db_entry = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered(&url_find, false, 5, 0) {
+                if let Some(l) = logs.iter().find(|l| l.url == url_find) {
+                    if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
+                        if detail.response_body.is_some() {
+                            db_entry = Some(detail);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let detail = db_entry.expect("DB log must be persisted");
+        let body = detail.response_body.expect("Response body must exist");
+        let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let status = db_json["stream_capture_status"].as_str().unwrap();
+        assert_ne!(status, "completed", "Client disconnect must NOT be marked as completed!");
+        assert_eq!(status, "client_disconnected");
+    }
+
+
+    #[tokio::test]
+    async fn test_upstream_error_marks_upstream_error_not_completed() {
+        let _test_guard = STREAM_TEST_LOCK.lock().await;
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+        use futures::{stream, StreamExt};
+        use std::sync::Arc;
+
+        let _ = crate::modules::proxy_db::init_db();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+
+        let url = format!("/sse_upstream_err_{}", uuid::Uuid::new_v4());
+        let url_req = url.clone();
+        let url_find = url.clone();
+
+        let app = Router::new()
+            .route(
+                &url,
+                get(|| async move {
+                    let items = vec![
+                        Ok(axum::body::Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")),
+                        Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Upstream died unexpectedly")),
+                    ];
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream::iter(items)))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
+
+        let req = axum::http::Request::builder().method("GET").uri(&url_req).body(axum::body::Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        let _ = body_stream.next().await;
+        let second = body_stream.next().await;
+        assert!(second.is_some() && second.unwrap().is_err(), "Client must observe upstream error");
+
+        let mut db_entry = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered(&url_find, false, 5, 0) {
+                if let Some(l) = logs.iter().find(|l| l.url == url_find) {
+                    if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
+                        if detail.response_body.is_some() {
+                            db_entry = Some(detail);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let detail = db_entry.expect("DB log must be persisted");
+        let body = detail.response_body.expect("Response body must exist");
+        let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let status = db_json["stream_capture_status"].as_str().unwrap();
+        assert_ne!(status, "completed", "Upstream error must NOT be marked as completed!");
+        assert_eq!(status, "upstream_error");
     }
 
 }
