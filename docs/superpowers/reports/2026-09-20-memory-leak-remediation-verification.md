@@ -38,7 +38,7 @@
 | 编号 | 原 Spec 验收标准定义 (逐字对应) | 涉及文件与修改点 | 验证证据与结果 | 状态 |
 | :--- | :--- | :--- | :--- | :---: |
 | **A1** | **10 MiB 正文得到合法预览，capacity 达到 G1 上限；原正文不变。** | `src-tauri/src/proxy/monitor.rs`: `truncate_str_safe` | `test_truncate_str_safe` 实测 10 MiB 输入得到 16 KiB + 后缀预览，`capacity <= 16419`，原 10 MiB 正文不变 | **PASS** |
-| **A2** | **中文/emoji 边界、空/None、恰好上限、短文本大 capacity；100 条循环替换后的正文容量总和有界。** | `src-tauri/src/proxy/monitor.rs`: `truncate_str_safe`, `test_monitor_100_logs_window_capacity_bounded` | 4 字节 Emoji 完整无乱码；空串返回空；恰好 16386 字节无后缀；10MB capacity 短文本被紧凑化；100 条总 capacity <= 3.3 MiB | **PASS** |
+| **A2** | **中文/emoji 边界、空/None、恰好上限、短文本大 capacity；100 条循环替换后的正文容量总和有界。** | `src-tauri/src/proxy/monitor.rs`: `truncate_str_safe`, `test_monitor_100_logs_window_capacity_bounded` | 4 字节 Emoji 完整无乱码；空串返回空；恰好 16384 字节无后缀；10MB capacity 短文本被紧凑化；100 条总 capacity <= 3.3 MiB | **PASS** |
 | **A3** | **数据库写入和读回完整正文，测试使用隔离数据目录和唯一 ID，等待持久化完成。** | `src-tauri/src/proxy/monitor.rs`: `test_monitor_db_persists_and_reads_back_full_body` | 隔离 SQLite 异步持久化，通过 `proxy_db::get_log_detail` 读回完整 50 KiB 正文，断言与原文 100% 一致 | **PASS** |
 | **A4** | **两次初始化后 Arc 相同，返回时配置/绑定已同步；热更新各字段立即被 manager 观察。** | `src-tauri/src/proxy/proxy_pool.rs`, `src-tauri/src/proxy/server.rs`: `shared_config()`, `update_config()` | `test_init_global_proxy_pool_reuse_and_update_config` 验证 `Arc::ptr_eq` 为真，绑定已同步，修改立即可见 | **PASS** |
 | **A5** | **首次创建后的重试路径、传入同一 Arc、并发初始化、重复启动健康检查无死锁/重复任务。** | `src-tauri/src/proxy/proxy_pool.rs`: `test_a5_same_arc_reinit_and_retry_path`, `test_concurrent_init_global_proxy_pool_canonical_arc`, `test_proxy_pool_start_stop_resume_lifecycle` | 同一 Arc 传入同步返回；10 任务并发无死锁且规范 Arc 一致；启停联动恢复单一任务，无活动任务泄漏 | **PASS** |
