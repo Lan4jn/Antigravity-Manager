@@ -3,7 +3,7 @@
 **生成日期**：2026-09-20  
 **验证分支**：`fix/memory-leaks`  
 **基线提交 (Base)**：`0802afd`  
-**复审修复提交**：`da8b0e6` (工作区最新状态)  
+**复审修复提交**：`4d2015e` (工作区最新状态)  
 **测试数据目录**：`/tmp/antigravity-remediation-run/candidate-data` (隔离环境)  
 
 ---
@@ -13,7 +13,7 @@
 | 编号 | 原 Spec 验收标准定义 (逐字对应) | 对应测试函数 | 执行测试命令 | 退出码 | 实际测量值 / 验证指标 | 验收结论 | 剩余问题与限制 |
 | :--- | :--- | :--- | :--- | :---: | :--- | :---: | :--- |
 | **A1** | **10 MiB 正文得到合法预览，capacity 达到 G1 上限；原正文不变。** | `test_truncate_str_safe` | `cargo test --lib proxy::monitor::tests::test_truncate_str_safe` | `0` | 输入 10 MiB (10,485,760 B)，预览截断至 16 KiB + 35 B 后缀，`preview.capacity() <= 16419`；原正文长度严格保持 10,485,760 B 不变 | **PASS** | 无剩余问题 |
-| **A2** | **中文/emoji 边界、空/None、恰好上限、短文本大 capacity；100 条循环替换后的正文容量总和有界。** | `test_truncate_str_safe`, `test_monitor_100_logs_window_capacity_bounded` | `cargo test --lib proxy::monitor::tests` | `0` | 4 字节 Emoji 完整保留不乱码；空串返回空；恰好 16384 字节不追加截断标；输入 10MB capacity 短文本被紧凑化为 capacity < 100；100 条日志正文 capacity 总和严格 <= 3.3 MiB | **PASS** | 无剩余问题 |
+| **A2** | **中文/emoji 边界、空/None、恰好上限、短文本大 capacity；100 条循环替换后的正文容量总和有界。** | `test_truncate_str_safe`, `test_monitor_100_logs_window_capacity_bounded` | `cargo test --lib proxy::monitor::tests` | `0` | 4 字节 Emoji 完整保留不乱码；空串返回空；恰好 16386 字节不追加截断标；输入 10MB capacity 短文本被紧凑化为 capacity < 100；100 条日志正文 capacity 总和严格 <= 3.3 MiB | **PASS** | 无剩余问题 |
 | **A3** | **数据库写入和读回完整正文，测试使用隔离数据目录和唯一 ID，等待持久化完成。** | `test_monitor_db_persists_and_reads_back_full_body` | `cargo test --lib proxy::monitor::tests::test_monitor_db_persists_and_reads_back_full_body` | `0` | 隔离 SQLite 数据库，异步写入 50 KiB 请求与 60 KiB 响应；通过 `proxy_db::get_log_detail` 读回，`assert_eq` 验证读回正文与输入 50 KiB 原文 100% 一致 | **PASS** | 轮询等待超时上限 5s，非固定 sleep |
 | **A4** | **两次初始化后 Arc 相同，返回时配置/绑定已同步；热更新各字段立即被 manager 观察。** | `test_init_global_proxy_pool_reuse_and_update_config` | `cargo test --lib proxy::proxy_pool::tests::test_init_global_proxy_pool_reuse_and_update_config` | `0` | 两次初始化返回相同 `manager`；`Arc::ptr_eq(&cfg1, &cfg2) == true`；返回时绑定同步完成；外部写入 `shared_config()` 或调用 `update_config` 立即可见 | **PASS** | 消除异步 spawn 竞态 |
 | **A5** | **首次创建后的重试路径、传入同一 Arc、并发初始化、重复启动健康检查无死锁/重复任务。** | `test_a5_same_arc_reinit_and_retry_path`, `test_concurrent_init_global_proxy_pool_canonical_arc`, `test_proxy_pool_start_stop_resume_lifecycle` | `cargo test --lib proxy::proxy_pool::tests -- --test-threads=1` | `0` | 传入同一 Arc 同步返回；10 任务并发初始化无死锁且规范 Arc 一致；启动→停止→再启动正确恢复巡检，旧任务已被 abort，全局仅 1 活动任务 | **PASS** | 需避免并发多线程污染全局单例 |
@@ -22,7 +22,7 @@
 | **A8** | **单会话连续 10,000 轮写入后最多 256 条；最新值可取，最旧值缺失；字节总和不超过预算。** | `session_signature_history_is_bounded` | `cargo test --lib proxy::signature_cache::tests::session_signature_history_is_bounded` | `0` | 连续写入 0..10000 轮：`history.len() <= 256`；第 0 轮缺失返回 None，第 9999 轮成功命中；保留签名 String capacity 总和为 ~25 KiB，严格 `<= 1024 * 1024` (1 MiB) | **PASS** | 超额严格优先弹出最小 message_count |
 | **A9** | **大签名触发字节淘汰；超预算单条拒绝；同轮覆盖、rewind、过期会话重建均符合 G4。** | `test_a9_rewind_and_same_turn_replacement`, `test_session_signature_single_session_turns_and_bytes_budget`, `test_expired_session_write_rebuilds_and_becomes_readable`, `test_reasoning_rejects_oversized_without_truncation` | `cargo test --lib proxy::signature_cache::tests` | `0` | 单条签名 > 1 MiB 或 reasoning > 128 KiB 直接拒绝（不破坏不截断）；同轮更长替换更短拒绝；rewind 删除未来轮次；过期会话写入重建空历史 | **PASS** | 协议完整性不受破坏 |
 | **A10** | **多会话外层上限、DashMap 并发写入后的容量收敛、任务退出及原有关联测试通过。** | `test_oversized_reasoning_does_not_create_session_or_allocate`, `test_dashmap_concurrent_writes_capacity_convergence`, `test_manager_drop_terminates_health_check_loop` | `cargo test --lib proxy::signature_cache && cargo test --lib proxy::cache_manager && cargo test --lib proxy::proxy_pool` | `0` | 2000 个超限输入 0 条入库（不破 1000 上限）；10 线程并发写入 DashMap 容量收敛至 `<= LIMIT`；Manager Drop 弱引用终止后台协程 | **PASS** | 无内存与协程泄漏 |
-| **A11** | **cargo check 与定向测试通过；整体测试失败完成同环境基线归因，修复新增失败。** | `cargo check`, `cargo test --lib proxy:: --offline -- --test-threads=1` | `cargo test --lib proxy:: --offline -- --test-threads=1` | `101` (8 基线失败) | `cargo check` 零编译错误；定向针对性测试 81 项 100% 全绿；`proxy::` 测试通过数由基线 562 项提升至 616 项（全库 663 项）；8 项失败与基线 100% 同构 | **PASS** | 8 项既有失败为历史静态快照问题 |
+| **A11** | **cargo check 与定向测试通过；整体测试失败完成同环境基线归因，修复新增失败。** | `cargo check`, `cargo test --lib proxy:: --offline -- --test-threads=1` | `cargo test --lib proxy:: --offline -- --test-threads=1` | `101` (8 基线失败) | `cargo check` 零编译错误；定向针对性测试 81 项 100% 全绿；`proxy::` 测试通过数由基线 562 项提升至 618 项（全库 665 项）；8 项失败与基线 100% 同构 | **PASS** | 8 项既有失败为历史静态快照问题 |
 
 ---
 
@@ -34,8 +34,8 @@
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **基线提交 (`0802afd`)** | 571 | 562 | 9 | 0 | 存在 1 个历史缓存测试 Bug + 8 个外部快照失败 |
 | **复审状态 (`b3efcfe`)** | 595 | 587 | 8 | 47 | 修复了基线缓存 Bug，但存在正文截断等缺陷 |
-| **当前状态 (HEAD)** | 623 | **616** | **8** | 47 | 针对性行为测试 84 项全绿，通过数较基线净增 53 项 |
-| **全库完整 (`--lib`)** | 670 | **663** | **8** | 0 | 全局除 8 项既有快照失败外全部通过 |
+| **当前状态 (HEAD)** | 623 | **618** | **8** | 47 | 针对性行为测试 86 项全绿，通过数较基线净增 53 项 |
+| **全库完整 (`--lib`)** | 670 | **665** | **8** | 0 | 全局除 8 项既有快照失败外全部通过 |
 
 ### 2.2 8 项既有历史失败明细与事实归因
 1. `proxy::mappers::claude::request::tests::test_claude_adaptive_global_config`
