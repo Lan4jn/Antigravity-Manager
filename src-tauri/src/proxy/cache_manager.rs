@@ -160,6 +160,34 @@ where
     }
 }
 
+const PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+fn enforce_payload_bytes<V>(
+    map: &DashMap<String, V>,
+    size: impl Fn(&V) -> usize,
+    accessed: impl Fn(&V) -> Instant,
+) {
+    loop {
+        let total: usize = map
+            .iter()
+            .map(|e| e.key().capacity().saturating_add(size(e.value())))
+            .sum();
+        if total <= PAYLOAD_BYTES {
+            break;
+        }
+        let key = {
+            map.iter()
+                .min_by_key(|e| accessed(e.value()))
+                .map(|e| e.key().clone())
+        };
+        if let Some(key) = key {
+            map.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
 impl CacheManager {
     /// 创建新的 CacheManager
     pub fn new() -> Self {
@@ -254,6 +282,10 @@ impl CacheManager {
 
     /// 存入 Layer 1: raw → sanitized
     pub fn cache_si(&self, raw_hash: String, sanitized_text: String) {
+        if raw_hash.len().saturating_add(sanitized_text.len()) > PAYLOAD_BYTES {
+            return;
+        }
+        let sanitized_text = sanitized_text.as_str().to_owned();
         let now = Instant::now();
         let entry = SiCacheEntry {
             sanitized_text,
@@ -263,6 +295,13 @@ impl CacheManager {
         };
 
         self.si_cache.insert(raw_hash.clone(), entry);
+        self.si_cache
+            .retain(|_, e| !Self::is_expired(e.timestamp, LAYER_12_TTL));
+        enforce_payload_bytes(
+            &self.si_cache,
+            |v| v.sanitized_text.capacity(),
+            |v| v.last_accessed,
+        );
         tracing::debug!(
             "[CacheManager:L1-SI] INSERT hash={}",
             &raw_hash[..raw_hash.len().min(16)]
@@ -355,6 +394,10 @@ impl CacheManager {
 
     /// 存入 Layer 2: raw → processed tools JSON
     pub fn cache_tools(&self, raw_hash: String, tools_json: String) {
+        if raw_hash.len().saturating_add(tools_json.len()) > PAYLOAD_BYTES {
+            return;
+        }
+        let tools_json = tools_json.as_str().to_owned();
         let now = Instant::now();
         let entry = ToolsCacheEntry {
             tools_json,
@@ -364,6 +407,13 @@ impl CacheManager {
         };
 
         self.tools_cache.insert(raw_hash.clone(), entry);
+        self.tools_cache
+            .retain(|_, e| !Self::is_expired(e.timestamp, LAYER_12_TTL));
+        enforce_payload_bytes(
+            &self.tools_cache,
+            |v| v.tools_json.capacity(),
+            |v| v.last_accessed,
+        );
         tracing::debug!(
             "[CacheManager:L2-Tools] INSERT hash={}",
             &raw_hash[..raw_hash.len().min(16)]
@@ -506,7 +556,9 @@ impl CacheManager {
             let before = self.prefix_tracker.len();
             let now = Instant::now();
             self.prefix_tracker.retain(|_, v| v.expires_at > now);
-            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| v.last_accessed);
+            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| {
+                v.last_accessed
+            });
             let after = self.prefix_tracker.len();
             if before != after {
                 tracing::debug!(
@@ -674,6 +726,29 @@ pub fn global_cache_manager() -> &'static CacheManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_budget_bounds_si_and_tools_below_entry_limits() {
+        let cm = super::CacheManager::new();
+        for i in 0..12 {
+            cm.cache_si(format!("si-{i}"), "s".repeat(1024 * 1024));
+            cm.cache_tools(format!("tools-{i}"), "t".repeat(1024 * 1024));
+        }
+        let si_bytes: usize = cm
+            .si_cache
+            .iter()
+            .map(|e| e.value().sanitized_text.capacity() + e.key().capacity())
+            .sum();
+        let tools_bytes: usize = cm
+            .tools_cache
+            .iter()
+            .map(|e| e.value().tools_json.capacity() + e.key().capacity())
+            .sum();
+        assert!(si_bytes <= 8 * 1024 * 1024, "SI: {si_bytes}");
+        assert!(tools_bytes <= 8 * 1024 * 1024, "tools: {tools_bytes}");
+        assert!(cm.si_cache.contains_key("si-11"));
+        assert!(cm.tools_cache.contains_key("tools-11"));
+    }
+
     use super::*;
     use std::thread;
 

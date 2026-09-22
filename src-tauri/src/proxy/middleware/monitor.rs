@@ -68,9 +68,9 @@ fn get_stream_failure_injection() -> StreamFailureInjection {
     }
 }
 
-
 #[cfg(test)]
-pub static CREATED_TEMP_PATHS: parking_lot::Mutex<Vec<std::path::PathBuf>> = parking_lot::Mutex::new(Vec::new());
+pub static CREATED_TEMP_PATHS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+    parking_lot::Mutex::new(Vec::new());
 
 #[cfg(test)]
 pub fn get_created_temp_paths() -> Vec<std::path::PathBuf> {
@@ -85,7 +85,10 @@ pub fn clear_created_temp_paths() {
 fn create_named_temp_file() -> std::io::Result<tempfile::NamedTempFile> {
     #[cfg(test)]
     if get_stream_failure_injection() == StreamFailureInjection::FailCreate {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Simulated tempfile creation failure"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Simulated tempfile creation failure",
+        ));
     }
     let file = tempfile::NamedTempFile::new()?;
     #[cfg(test)]
@@ -103,8 +106,13 @@ struct SpillWriter {
 impl std::io::Write for SpillWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         #[cfg(test)]
-        if get_stream_failure_injection() == StreamFailureInjection::FailWrite && self.bytes_written > 1024 * 1024 {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Simulated disk write failure"));
+        if get_stream_failure_injection() == StreamFailureInjection::FailWrite
+            && self.bytes_written > 1024 * 1024
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Simulated disk write failure",
+            ));
         }
         let n = self.inner.write(buf)?;
         self.bytes_written += n;
@@ -114,16 +122,24 @@ impl std::io::Write for SpillWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         #[cfg(test)]
         if get_stream_failure_injection() == StreamFailureInjection::FailFlush {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Simulated flush failure"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Simulated flush failure",
+            ));
         }
         self.inner.flush()
     }
 }
 
-fn seek_and_open_reader(mut temp_file: tempfile::NamedTempFile) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
+fn seek_and_open_reader(
+    mut temp_file: tempfile::NamedTempFile,
+) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
     #[cfg(test)]
     if get_stream_failure_injection() == StreamFailureInjection::FailSeek {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Simulated seek failure"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Simulated seek failure",
+        ));
     }
     use std::io::Seek;
     temp_file.seek(std::io::SeekFrom::Start(0))?;
@@ -133,7 +149,10 @@ fn seek_and_open_reader(mut temp_file: tempfile::NamedTempFile) -> std::io::Resu
         struct FailingRead(tempfile::NamedTempFile);
         impl std::io::Read for FailingRead {
             fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Simulated read failure mid-stream"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Simulated read failure mid-stream",
+                ))
             }
         }
         return Ok(Box::new(std::io::BufReader::new(FailingRead(temp_file))));
@@ -487,12 +506,123 @@ fn extract_output_tokens(usage: &Value) -> Option<u32> {
     }
 }
 
+// Admission happens before reading request bodies, so queued requests do not own
+// complete logging payloads. The permit remains held through persistence.
+static LOG_CAPTURE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+// Unknown JSON fields are skipped by serde without allocating full output text.
+#[derive(Default, serde::Deserialize)]
+struct UsageEvent {
+    usage: Option<Value>,
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<Value>,
+    response: Option<Box<UsageEvent>>,
+    message: Option<Box<UsageEvent>>,
+    delta: Option<Box<UsageEvent>>,
+}
+
+#[derive(Default)]
+struct UsageScanner {
+    pending: Vec<u8>,
+    // Only an oversized individual event is spooled, never the full response.
+    spill: Option<std::fs::File>,
+    failed: bool,
+    event_bytes: usize,
+    input: Option<u32>,
+    output: Option<u32>,
+    cached: Option<u32>,
+}
+
+impl UsageScanner {
+    fn feed(&mut self, bytes: &[u8]) {
+        use std::io::{Read, Seek, Write};
+        for part in bytes.split_inclusive(|b| *b == b'\n') {
+            self.event_bytes = self.event_bytes.saturating_add(part.len());
+            if self.event_bytes > MAX_RESPONSE_LOG_SIZE && !self.failed {
+                tracing::warn!("Usage event exceeds 100 MiB monitoring limit");
+                self.failed = true;
+                self.spill = None;
+                self.pending = Vec::new();
+            }
+            if !self.failed {
+                let result = (|| -> std::io::Result<()> {
+                    if self.spill.is_none()
+                        && self.pending.len().saturating_add(part.len()) > 64 * 1024
+                    {
+                        let mut file = tempfile::tempfile()?;
+                        file.write_all(&self.pending)?;
+                        self.pending = Vec::new();
+                        self.spill = Some(file);
+                    }
+                    if let Some(file) = self.spill.as_mut() {
+                        file.write_all(part)?;
+                    } else {
+                        self.pending.extend_from_slice(part);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    tracing::warn!("Usage event capture failed: {}", error);
+                    self.failed = true;
+                }
+            }
+            if part.last() == Some(&b'\n') {
+                if !self.failed {
+                    let event = if let Some(mut file) = self.spill.take() {
+                        (|| -> Option<UsageEvent> {
+                            file.rewind().ok()?;
+                            let mut prefix = [0; 6];
+                            file.read_exact(&mut prefix).ok()?;
+                            if &prefix != b"data: " {
+                                return None;
+                            }
+                            serde_json::from_reader(std::io::BufReader::new(file)).ok()
+                        })()
+                    } else {
+                        self.pending
+                            .strip_prefix(b"data: ")
+                            .and_then(|data| serde_json::from_slice::<UsageEvent>(data).ok())
+                    };
+                    if let Some(event) = event {
+                        self.observe(event);
+                    }
+                }
+                self.pending.clear();
+                self.spill = None;
+                self.failed = false;
+                self.event_bytes = 0;
+            }
+        }
+    }
+
+    fn observe(&mut self, event: UsageEvent) {
+        if let Some(usage) = event.usage.or(event.usage_metadata) {
+            self.input = extract_input_tokens(&usage).or(self.input);
+            self.output = extract_output_tokens(&usage).or(self.output);
+            self.cached = extract_cached_tokens(&usage).or(self.cached);
+            if self.input.is_none() && self.output.is_none() {
+                self.output = usage
+                    .get("total_tokens")
+                    .or_else(|| usage.get("totalTokenCount"))
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32);
+            }
+        }
+        for nested in [event.response, event.message, event.delta]
+            .into_iter()
+            .flatten()
+        {
+            self.observe(*nested);
+        }
+    }
+}
+
 pub async fn monitor_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
-    let _logging_enabled = state.monitor.is_enabled();
+    let logging_enabled = state.monitor.is_enabled();
 
     let method = request.method().to_string();
     let uri = request.uri().to_string();
@@ -541,6 +671,17 @@ pub async fn monitor_middleware(
         None
     };
 
+    let capture_permit = if logging_enabled {
+        Some(
+            LOG_CAPTURE_SLOTS
+                .acquire()
+                .await
+                .expect("logging semaphore is never closed"),
+        )
+    } else {
+        None
+    };
+    let mut estimated_input_tokens = None;
     let request_body_str;
 
     // [FIX] 从请求 extensions 提取 UserTokenIdentity (由 Auth 中间件注入)
@@ -573,7 +714,13 @@ pub async fn monitor_middleware(
                                 .map(|s| s.to_string())
                         });
                     }
-                    Some(s.to_string())
+                    if !logging_enabled {
+                        let estimate = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(s);
+                        if estimate > 0 {
+                            estimated_input_tokens = Some(estimate);
+                        }
+                    }
+                    logging_enabled.then(|| s.to_string())
                 } else {
                     Some("[Binary Request Data]".to_string())
                 };
@@ -673,6 +820,8 @@ pub async fn monitor_middleware(
             const STREAM_MEMORY_SPILL_BYTES: usize = 1024 * 1024; // 1MB 内存缓冲，超过溢出到临时文件
             const MAX_STREAM_PERSIST_BYTES: usize = 100 * 1024 * 1024; // 100MB 磁盘流式日志安全上限
 
+            let capture_permit = capture_permit;
+            let mut usage_scanner = UsageScanner::default();
             let mut sink = StreamCaptureSink::Memory(Vec::with_capacity(64 * 1024));
             let mut bytes_forwarded = 0usize;
             let mut bytes_captured = 0usize;
@@ -681,9 +830,6 @@ pub async fn monitor_middleware(
             let mut capture_error: Option<String> = None;
             let mut client_disconnected = false;
             let mut upstream_error: Option<String> = None;
-
-            #[cfg(test)]
-            let fail_mode = get_stream_failure_injection();
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
@@ -694,8 +840,14 @@ pub async fn monitor_middleware(
                     }
                     bytes_forwarded += chunk.len();
 
+                    if !logging_enabled {
+                        usage_scanner.feed(&chunk);
+                        continue;
+                    }
                     // 2. 捕获并落盘
-                    if capture_error.is_none() && bytes_captured + chunk.len() <= MAX_STREAM_PERSIST_BYTES {
+                    if capture_error.is_none()
+                        && bytes_captured + chunk.len() <= MAX_STREAM_PERSIST_BYTES
+                    {
                         match &mut sink {
                             StreamCaptureSink::Memory(buf) => {
                                 if buf.len() + chunk.len() <= STREAM_MEMORY_SPILL_BYTES {
@@ -705,7 +857,10 @@ pub async fn monitor_middleware(
                                     match create_named_temp_file() {
                                         Ok(mut temp) => {
                                             use std::io::Write;
-                                            if let Err(e) = temp.write_all(buf).and_then(|_| temp.write_all(&chunk)) {
+                                            if let Err(e) = temp
+                                                .write_all(buf)
+                                                .and_then(|_| temp.write_all(&chunk))
+                                            {
                                                 capture_error = Some(format!("Failed to write initial chunks to spill file: {}", e));
                                                 sink = StreamCaptureSink::Failed;
                                             } else {
@@ -717,7 +872,10 @@ pub async fn monitor_middleware(
                                             }
                                         }
                                         Err(e) => {
-                                            capture_error = Some(format!("Failed to create temporary spill file: {}", e));
+                                            capture_error = Some(format!(
+                                                "Failed to create temporary spill file: {}",
+                                                e
+                                            ));
                                             sink = StreamCaptureSink::Failed;
                                         }
                                     }
@@ -726,7 +884,8 @@ pub async fn monitor_middleware(
                             StreamCaptureSink::Spill(writer) => {
                                 use std::io::Write;
                                 if let Err(e) = writer.write_all(&chunk) {
-                                    capture_error = Some(format!("Failed to write chunk to spill file: {}", e));
+                                    capture_error =
+                                        Some(format!("Failed to write chunk to spill file: {}", e));
                                     sink = StreamCaptureSink::Failed;
                                 } else {
                                     bytes_captured += chunk.len();
@@ -757,6 +916,16 @@ pub async fn monitor_middleware(
             }
             drop(stream);
 
+            if !logging_enabled {
+                usage_scanner.feed(b"\n");
+                log.input_tokens = usage_scanner.input.or(estimated_input_tokens);
+                log.output_tokens = usage_scanner.output;
+                log.cached_tokens = usage_scanner.cached;
+                record_user_token_usage(&user_token_identity, &log, user_agent.clone());
+                monitor.log_request_with_permit(log, capture_permit).await;
+                return;
+            }
+
             // Parse and consolidate stream data into readable format using buffered reader
             use std::io::BufRead;
             let lines_reader: Box<dyn std::io::BufRead + Send> = match sink {
@@ -771,12 +940,14 @@ pub async fn monitor_middleware(
                             Ok(temp_file) => match seek_and_open_reader(temp_file) {
                                 Ok(reader) => reader,
                                 Err(e) => {
-                                    capture_error = Some(format!("Failed to seek spill file: {}", e));
+                                    capture_error =
+                                        Some(format!("Failed to seek spill file: {}", e));
                                     Box::new(std::io::Cursor::new(Vec::new()))
                                 }
                             },
                             Err(e) => {
-                                capture_error = Some(format!("Failed to unwrap spill writer: {}", e));
+                                capture_error =
+                                    Some(format!("Failed to unwrap spill writer: {}", e));
                                 Box::new(std::io::Cursor::new(Vec::new()))
                             }
                         }
@@ -796,79 +967,75 @@ pub async fn monitor_middleware(
                 let line = match line_res {
                     Ok(l) => l,
                     Err(e) => {
-                        capture_error = Some(format!("Failed to read stream line from spill file: {}", e));
+                        capture_error =
+                            Some(format!("Failed to read stream line from spill file: {}", e));
                         break;
                     }
                 };
-                    if !line.starts_with("data: ") {
-                        continue;
-                    }
-                    let json_str = line.trim_start_matches("data: ").trim();
-                    if json_str == "[DONE]" {
-                        continue;
-                    }
+                if !line.starts_with("data: ") {
+                    continue;
+                }
+                let json_str = line.trim_start_matches("data: ").trim();
+                if json_str == "[DONE]" {
+                    continue;
+                }
 
-                    if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                        // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
-                        if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                            for choice in choices {
-                                if let Some(delta) = choice.get("delta") {
-                                    // Thinking/reasoning content
-                                    if let Some(thinking) =
-                                        delta.get("reasoning_content").and_then(|v| v.as_str())
-                                    {
-                                        thinking_content.push_str(thinking);
-                                    }
-                                    // Main response content
-                                    if let Some(content) =
-                                        delta.get("content").and_then(|v| v.as_str())
-                                    {
-                                        response_content.push_str(content);
-                                    }
-                                    // Tool calls
-                                    if let Some(delta_tool_calls) =
-                                        delta.get("tool_calls").and_then(|t| t.as_array())
-                                    {
-                                        for tc in delta_tool_calls {
-                                            if let Some(index) =
-                                                tc.get("index").and_then(|i| i.as_u64())
+                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                    // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
+                    if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                        for choice in choices {
+                            if let Some(delta) = choice.get("delta") {
+                                // Thinking/reasoning content
+                                if let Some(thinking) =
+                                    delta.get("reasoning_content").and_then(|v| v.as_str())
+                                {
+                                    thinking_content.push_str(thinking);
+                                }
+                                // Main response content
+                                if let Some(content) = delta.get("content").and_then(|v| v.as_str())
+                                {
+                                    response_content.push_str(content);
+                                }
+                                // Tool calls
+                                if let Some(delta_tool_calls) =
+                                    delta.get("tool_calls").and_then(|t| t.as_array())
+                                {
+                                    for tc in delta_tool_calls {
+                                        if let Some(index) =
+                                            tc.get("index").and_then(|i| i.as_u64())
+                                        {
+                                            let idx = index as usize;
+                                            while tool_calls.len() <= idx {
+                                                tool_calls.push(serde_json::json!({
+                                                    "id": "",
+                                                    "type": "function",
+                                                    "function": { "name": "", "arguments": "" }
+                                                }));
+                                            }
+                                            let current_tc = &mut tool_calls[idx];
+                                            if let Some(id) = tc.get("id").and_then(|v| v.as_str())
                                             {
-                                                let idx = index as usize;
-                                                while tool_calls.len() <= idx {
-                                                    tool_calls.push(serde_json::json!({
-                                                        "id": "",
-                                                        "type": "function",
-                                                        "function": { "name": "", "arguments": "" }
-                                                    }));
-                                                }
-                                                let current_tc = &mut tool_calls[idx];
-                                                if let Some(id) =
-                                                    tc.get("id").and_then(|v| v.as_str())
+                                                current_tc["id"] = Value::String(id.to_string());
+                                            }
+                                            if let Some(func) = tc.get("function") {
+                                                if let Some(name) =
+                                                    func.get("name").and_then(|v| v.as_str())
                                                 {
-                                                    current_tc["id"] =
-                                                        Value::String(id.to_string());
+                                                    current_tc["function"]["name"] =
+                                                        Value::String(name.to_string());
                                                 }
-                                                if let Some(func) = tc.get("function") {
-                                                    if let Some(name) =
-                                                        func.get("name").and_then(|v| v.as_str())
-                                                    {
-                                                        current_tc["function"]["name"] =
-                                                            Value::String(name.to_string());
-                                                    }
-                                                    if let Some(args) = func
-                                                        .get("arguments")
-                                                        .and_then(|v| v.as_str())
-                                                    {
-                                                        let old_args = current_tc["function"]
-                                                            ["arguments"]
-                                                            .as_str()
-                                                            .unwrap_or("");
-                                                        current_tc["function"]["arguments"] =
-                                                            Value::String(format!(
-                                                                "{}{}",
-                                                                old_args, args
-                                                            ));
-                                                    }
+                                                if let Some(args) =
+                                                    func.get("arguments").and_then(|v| v.as_str())
+                                                {
+                                                    let old_args = current_tc["function"]
+                                                        ["arguments"]
+                                                        .as_str()
+                                                        .unwrap_or("");
+                                                    current_tc["function"]["arguments"] =
+                                                        Value::String(format!(
+                                                            "{}{}",
+                                                            old_args, args
+                                                        ));
                                                 }
                                             }
                                         }
@@ -876,135 +1043,56 @@ pub async fn monitor_middleware(
                                 }
                             }
                         }
+                    }
 
-                        // Claude/Anthropic format: content_block_start, content_block_delta, etc.
-                        let msg_type = json.get("type").and_then(|t| t.as_str());
-                        match msg_type {
-                            Some("content_block_start") => {
-                                if let (Some(index), Some(block)) = (
-                                    json.get("index").and_then(|i| i.as_u64()),
-                                    json.get("content_block"),
-                                ) {
-                                    let idx = index as usize;
-                                    if block.get("type").and_then(|t| t.as_str())
-                                        == Some("tool_use")
-                                    {
-                                        let id =
-                                            block.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                        let name = block
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        while tool_calls.len() <= idx {
-                                            tool_calls.push(Value::Null);
-                                        }
-                                        tool_calls[idx] = serde_json::json!({
-                                            "id": id,
-                                            "type": "function",
-                                            "function": { "name": name, "arguments": "" }
-                                        });
+                    // Claude/Anthropic format: content_block_start, content_block_delta, etc.
+                    let msg_type = json.get("type").and_then(|t| t.as_str());
+                    match msg_type {
+                        Some("content_block_start") => {
+                            if let (Some(index), Some(block)) = (
+                                json.get("index").and_then(|i| i.as_u64()),
+                                json.get("content_block"),
+                            ) {
+                                let idx = index as usize;
+                                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                                    let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name =
+                                        block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    while tool_calls.len() <= idx {
+                                        tool_calls.push(Value::Null);
                                     }
+                                    tool_calls[idx] = serde_json::json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": "" }
+                                    });
                                 }
                             }
-                            Some("content_block_delta") => {
-                                if let (Some(index), Some(delta)) = (
-                                    json.get("index").and_then(|i| i.as_u64()),
-                                    json.get("delta"),
-                                ) {
-                                    let idx = index as usize;
-
-                                    // Tool use input delta
-                                    if let Some(delta_json) =
-                                        delta.get("input_json_delta").and_then(|v| v.as_str())
-                                    {
-                                        if idx < tool_calls.len() && !tool_calls[idx].is_null() {
-                                            let old_args = tool_calls[idx]["function"]["arguments"]
-                                                .as_str()
-                                                .unwrap_or("");
-                                            tool_calls[idx]["function"]["arguments"] =
-                                                Value::String(format!(
-                                                    "{}{}",
-                                                    old_args, delta_json
-                                                ));
-                                        }
-                                    }
-                                    // Legacy/Native thinking block
-                                    if let Some(thinking) =
-                                        delta.get("thinking").and_then(|v| v.as_str())
-                                    {
-                                        thinking_content.push_str(thinking);
-                                    }
-                                    // Text content
-                                    if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                        response_content.push_str(text);
-                                    }
-                                }
-                            }
-                            Some("message_delta") => {
-                                if let Some(delta) = json.get("delta") {
-                                    if let Some(usage) = delta.get("usage") {
-                                        if let Some(output_tokens) =
-                                            usage.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            log.output_tokens = Some(output_tokens as u32);
-                                        }
-                                    }
-                                }
-                            }
-                            Some("response.output_text.delta") => {
-                                if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
-                                    response_content.push_str(text);
-                                }
-                            }
-                            Some("response.reasoning_summary_text.delta") => {
-                                if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
-                                    thinking_content.push_str(text);
-                                }
-                            }
-                            Some("response.output_item.added") => {
-                                if let Some(item) = json.get("item") {
-                                    if item.get("type").and_then(|t| t.as_str())
-                                        == Some("function_call")
-                                    {
-                                        let name =
-                                            item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let id = item
-                                            .get("call_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        tool_calls.push(serde_json::json!({
-                                            "id": id,
-                                            "type": "function",
-                                            "function": { "name": name, "arguments": "" }
-                                        }));
-                                    }
-                                }
-                            }
-                            Some("response.function_call_arguments.delta") => {
-                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
-                                    if let Some(last_tc) = tool_calls.last_mut() {
-                                        let old_args =
-                                            last_tc["function"]["arguments"].as_str().unwrap_or("");
-                                        last_tc["function"]["arguments"] =
-                                            Value::String(format!("{}{}", old_args, delta));
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        Some("content_block_delta") => {
+                            if let (Some(index), Some(delta)) = (
+                                json.get("index").and_then(|i| i.as_u64()),
+                                json.get("delta"),
+                            ) {
+                                let idx = index as usize;
 
-                        // Legacy Claude delta (for older implementations or simplified streams)
-                        if msg_type.is_none() {
-                            if let Some(delta) = json.get("delta") {
-                                // Thinking block
+                                // Tool use input delta
+                                if let Some(delta_json) =
+                                    delta.get("input_json_delta").and_then(|v| v.as_str())
+                                {
+                                    if idx < tool_calls.len() && !tool_calls[idx].is_null() {
+                                        let old_args = tool_calls[idx]["function"]["arguments"]
+                                            .as_str()
+                                            .unwrap_or("");
+                                        tool_calls[idx]["function"]["arguments"] =
+                                            Value::String(format!("{}{}", old_args, delta_json));
+                                    }
+                                }
+                                // Legacy/Native thinking block
                                 if let Some(thinking) =
                                     delta.get("thinking").and_then(|v| v.as_str())
                                 {
                                     thinking_content.push_str(thinking);
-                                }
-                                // Thinking signature
-                                if let Some(sig) = delta.get("signature").and_then(|v| v.as_str()) {
-                                    thinking_signature = sig.to_string();
                                 }
                                 // Text content
                                 if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
@@ -1012,170 +1100,261 @@ pub async fn monitor_middleware(
                                 }
                             }
                         }
+                        Some("message_delta") => {
+                            if let Some(delta) = json.get("delta") {
+                                if let Some(usage) = delta.get("usage") {
+                                    if let Some(output_tokens) =
+                                        usage.get("output_tokens").and_then(|v| v.as_u64())
+                                    {
+                                        log.output_tokens = Some(output_tokens as u32);
+                                    }
+                                }
+                            }
+                        }
+                        Some("response.output_text.delta") => {
+                            if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
+                                response_content.push_str(text);
+                            }
+                        }
+                        Some("response.reasoning_summary_text.delta") => {
+                            if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
+                                thinking_content.push_str(text);
+                            }
+                        }
+                        Some("response.output_item.added") => {
+                            if let Some(item) = json.get("item") {
+                                if item.get("type").and_then(|t| t.as_str())
+                                    == Some("function_call")
+                                {
+                                    let name =
+                                        item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let id =
+                                        item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    tool_calls.push(serde_json::json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": "" }
+                                    }));
+                                }
+                            }
+                        }
+                        Some("response.function_call_arguments.delta") => {
+                            if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                                if let Some(last_tc) = tool_calls.last_mut() {
+                                    let old_args =
+                                        last_tc["function"]["arguments"].as_str().unwrap_or("");
+                                    last_tc["function"]["arguments"] =
+                                        Value::String(format!("{}{}", old_args, delta));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
 
-                        // Token usage extraction
-                        if let Some(usage) = json
-                            .get("usage")
-                            .or(json.get("usageMetadata"))
-                            .or(json.get("response").and_then(|r| r.get("usage")))
-                            .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                        {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                            reasoning_tokens =
-                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
+                    // Legacy Claude delta (for older implementations or simplified streams)
+                    if msg_type.is_none() {
+                        if let Some(delta) = json.get("delta") {
+                            // Thinking block
+                            if let Some(thinking) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                thinking_content.push_str(thinking);
+                            }
+                            // Thinking signature
+                            if let Some(sig) = delta.get("signature").and_then(|v| v.as_str()) {
+                                thinking_signature = sig.to_string();
+                            }
+                            // Text content
+                            if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                response_content.push_str(text);
                             }
                         }
                     }
-                }
 
-                // Build consolidated response object
-                let mut consolidated = serde_json::Map::new();
-                let has_actual_content = !response_content.is_empty()
-                    || !tool_calls.is_empty()
-                    || !thinking_content.is_empty();
+                    // Token usage extraction
+                    if let Some(usage) = json
+                        .get("usage")
+                        .or(json.get("usageMetadata"))
+                        .or(json.get("response").and_then(|r| r.get("usage")))
+                        .or(json.get("response").and_then(|r| r.get("usageMetadata")))
+                    {
+                        log.input_tokens = extract_input_tokens(usage);
+                        log.output_tokens = extract_output_tokens(usage);
+                        cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
+                        log.cached_tokens = log.cached_tokens.or(cached_tokens);
+                        reasoning_tokens =
+                            reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
 
-                if !thinking_content.is_empty() {
-                    consolidated.insert("thinking".to_string(), Value::String(thinking_content));
-                }
-                if !thinking_signature.is_empty() {
-                    consolidated.insert(
-                        "thinking_signature".to_string(),
-                        Value::String(thinking_signature),
-                    );
-                }
-                if !response_content.is_empty() {
-                    consolidated.insert("content".to_string(), Value::String(response_content));
-                }
-
-                if !tool_calls.is_empty() {
-                    let clean_tool_calls: Vec<Value> =
-                        tool_calls.into_iter().filter(|v| !v.is_null()).collect();
-                    if !clean_tool_calls.is_empty() {
-                        consolidated
-                            .insert("tool_calls".to_string(), Value::Array(clean_tool_calls));
+                        if log.input_tokens.is_none() && log.output_tokens.is_none() {
+                            log.output_tokens = usage
+                                .get("total_tokens")
+                                .or(usage.get("totalTokenCount"))
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32);
+                        }
                     }
                 }
-                if has_actual_content {
-                    let mut usage_obj = serde_json::Map::new();
-                    let input_toks = log.input_tokens.unwrap_or(0);
-                    let output_toks = log.output_tokens.unwrap_or(0);
-                    let cached_toks = cached_tokens.unwrap_or(0);
-                    let reasoning_toks = reasoning_tokens.unwrap_or(0);
-                    let is_responses_api =
-                        log.url.contains("/responses") || log.url.contains("/interactions");
+            }
 
-                    if is_responses_api {
-                        usage_obj
-                            .insert("input_tokens".to_string(), Value::Number(input_toks.into()));
+            // Build consolidated response object
+            let mut consolidated = serde_json::Map::new();
+            let has_actual_content = !response_content.is_empty()
+                || !tool_calls.is_empty()
+                || !thinking_content.is_empty();
+
+            if !thinking_content.is_empty() {
+                consolidated.insert("thinking".to_string(), Value::String(thinking_content));
+            }
+            if !thinking_signature.is_empty() {
+                consolidated.insert(
+                    "thinking_signature".to_string(),
+                    Value::String(thinking_signature),
+                );
+            }
+            if !response_content.is_empty() {
+                consolidated.insert("content".to_string(), Value::String(response_content));
+            }
+
+            if !tool_calls.is_empty() {
+                let clean_tool_calls: Vec<Value> =
+                    tool_calls.into_iter().filter(|v| !v.is_null()).collect();
+                if !clean_tool_calls.is_empty() {
+                    consolidated.insert("tool_calls".to_string(), Value::Array(clean_tool_calls));
+                }
+            }
+            if has_actual_content {
+                let mut usage_obj = serde_json::Map::new();
+                let input_toks = log.input_tokens.unwrap_or(0);
+                let output_toks = log.output_tokens.unwrap_or(0);
+                let cached_toks = cached_tokens.unwrap_or(0);
+                let reasoning_toks = reasoning_tokens.unwrap_or(0);
+                let is_responses_api =
+                    log.url.contains("/responses") || log.url.contains("/interactions");
+
+                if is_responses_api {
+                    usage_obj.insert("input_tokens".to_string(), Value::Number(input_toks.into()));
+                    usage_obj.insert(
+                        "input_tokens_details".to_string(),
+                        serde_json::json!({ "cached_tokens": cached_toks }),
+                    );
+                    usage_obj.insert(
+                        "output_tokens".to_string(),
+                        Value::Number(output_toks.into()),
+                    );
+                    usage_obj.insert(
+                        "output_tokens_details".to_string(),
+                        serde_json::json!({ "reasoning_tokens": reasoning_toks }),
+                    );
+                    usage_obj.insert(
+                        "total_tokens".to_string(),
+                        Value::Number((input_toks + output_toks).into()),
+                    );
+                } else {
+                    usage_obj.insert(
+                        "prompt_tokens".to_string(),
+                        Value::Number(input_toks.into()),
+                    );
+                    usage_obj.insert(
+                        "completion_tokens".to_string(),
+                        Value::Number(output_toks.into()),
+                    );
+                    usage_obj.insert(
+                        "total_tokens".to_string(),
+                        Value::Number((input_toks + output_toks).into()),
+                    );
+                    if cached_tokens.is_some() {
                         usage_obj.insert(
-                            "input_tokens_details".to_string(),
+                            "cache_read_input_tokens".to_string(),
+                            Value::Number(cached_toks.into()),
+                        );
+                        usage_obj.insert(
+                            "prompt_tokens_details".to_string(),
                             serde_json::json!({ "cached_tokens": cached_toks }),
                         );
+                    }
+                    if reasoning_tokens.is_some() {
                         usage_obj.insert(
-                            "output_tokens".to_string(),
-                            Value::Number(output_toks.into()),
-                        );
-                        usage_obj.insert(
-                            "output_tokens_details".to_string(),
+                            "completion_tokens_details".to_string(),
                             serde_json::json!({ "reasoning_tokens": reasoning_toks }),
                         );
-                        usage_obj.insert(
-                            "total_tokens".to_string(),
-                            Value::Number((input_toks + output_toks).into()),
-                        );
-                    } else {
-                        usage_obj.insert(
-                            "prompt_tokens".to_string(),
-                            Value::Number(input_toks.into()),
-                        );
-                        usage_obj.insert(
-                            "completion_tokens".to_string(),
-                            Value::Number(output_toks.into()),
-                        );
-                        usage_obj.insert(
-                            "total_tokens".to_string(),
-                            Value::Number((input_toks + output_toks).into()),
-                        );
-                        if cached_tokens.is_some() {
-                            usage_obj.insert(
-                                "cache_read_input_tokens".to_string(),
-                                Value::Number(cached_toks.into()),
-                            );
-                            usage_obj.insert(
-                                "prompt_tokens_details".to_string(),
-                                serde_json::json!({ "cached_tokens": cached_toks }),
-                            );
-                        }
-                        if reasoning_tokens.is_some() {
-                            usage_obj.insert(
-                                "completion_tokens_details".to_string(),
-                                serde_json::json!({ "reasoning_tokens": reasoning_toks }),
-                            );
-                        }
                     }
-                    consolidated.insert("usage".to_string(), Value::Object(usage_obj));
                 }
+                consolidated.insert("usage".to_string(), Value::Object(usage_obj));
+            }
 
-                consolidated.insert("bytes_forwarded".to_string(), serde_json::json!(bytes_forwarded));
-                consolidated.insert("bytes_captured".to_string(), serde_json::json!(bytes_captured));
+            consolidated.insert(
+                "bytes_forwarded".to_string(),
+                serde_json::json!(bytes_forwarded),
+            );
+            consolidated.insert(
+                "bytes_captured".to_string(),
+                serde_json::json!(bytes_captured),
+            );
 
-                // 1. 流终止原因 (stream_termination_reason)
-                let termination_reason = if let Some(ref uerr) = upstream_error {
-                    consolidated.insert("upstream_error".to_string(), serde_json::json!(uerr));
-                    if log.error.is_none() {
-                        log.error = Some(format!("Upstream error during stream: {}", uerr));
-                    }
-                    "upstream_error"
-                } else if client_disconnected {
-                    if log.error.is_none() {
-                        log.error = Some(format!("Client disconnected prematurely after {} bytes forwarded (captured: {})", bytes_forwarded, bytes_captured));
-                    }
-                    "client_cancelled"
-                } else if stream_truncated {
-                    "truncated"
-                } else {
-                    "normal_eof"
-                };
-                consolidated.insert("stream_termination_reason".to_string(), serde_json::json!(termination_reason));
-
-                // 2. 日志捕获状态 (stream_capture_status)
-                let capture_status = if let Some(ref err) = capture_error {
-                    consolidated.insert("stream_capture_error".to_string(), serde_json::json!(err));
-                    if log.error.is_none() {
-                        log.error = Some(format!("Stream capture failed: {} (forwarded: {}, captured: {})", err, bytes_forwarded, bytes_captured));
-                    }
-                    "failed"
-                } else if stream_truncated {
-                    "truncated"
-                } else if client_disconnected || upstream_error.is_some() {
-                    "partial"
-                } else {
-                    "completed"
-                };
-                consolidated.insert("stream_capture_status".to_string(), serde_json::json!(capture_status));
-
-                if consolidated.is_empty() {
-                    if let Some(ref err) = capture_error {
-                        log.response_body = Some(format!("[STREAM CAPTURE FAILED: {} (forwarded: {}, captured: {})]", err, bytes_forwarded, bytes_captured));
-                    } else {
-                        log.response_body = Some(format!("[Stream Data: forwarded {} bytes, captured {} bytes]", bytes_forwarded, bytes_captured));
-                    }
-                } else {
-                    log.response_body = Some(
-                        serde_json::to_string_pretty(&Value::Object(consolidated))
-                            .unwrap_or_else(|_| format!("[Consolidated Stream Data: {} bytes]", bytes_forwarded)),
-                    );
+            // 1. 流终止原因 (stream_termination_reason)
+            let termination_reason = if let Some(ref uerr) = upstream_error {
+                consolidated.insert("upstream_error".to_string(), serde_json::json!(uerr));
+                if log.error.is_none() {
+                    log.error = Some(format!("Upstream error during stream: {}", uerr));
                 }
+                "upstream_error"
+            } else if client_disconnected {
+                if log.error.is_none() {
+                    log.error = Some(format!(
+                        "Client disconnected prematurely after {} bytes forwarded (captured: {})",
+                        bytes_forwarded, bytes_captured
+                    ));
+                }
+                "client_cancelled"
+            } else if stream_truncated {
+                "truncated"
+            } else {
+                "normal_eof"
+            };
+            consolidated.insert(
+                "stream_termination_reason".to_string(),
+                serde_json::json!(termination_reason),
+            );
+
+            // 2. 日志捕获状态 (stream_capture_status)
+            let capture_status = if let Some(ref err) = capture_error {
+                consolidated.insert("stream_capture_error".to_string(), serde_json::json!(err));
+                if log.error.is_none() {
+                    log.error = Some(format!(
+                        "Stream capture failed: {} (forwarded: {}, captured: {})",
+                        err, bytes_forwarded, bytes_captured
+                    ));
+                }
+                "failed"
+            } else if stream_truncated {
+                "truncated"
+            } else if client_disconnected || upstream_error.is_some() {
+                "partial"
+            } else {
+                "completed"
+            };
+            consolidated.insert(
+                "stream_capture_status".to_string(),
+                serde_json::json!(capture_status),
+            );
+
+            if consolidated.is_empty() {
+                if let Some(ref err) = capture_error {
+                    log.response_body = Some(format!(
+                        "[STREAM CAPTURE FAILED: {} (forwarded: {}, captured: {})]",
+                        err, bytes_forwarded, bytes_captured
+                    ));
+                } else {
+                    log.response_body = Some(format!(
+                        "[Stream Data: forwarded {} bytes, captured {} bytes]",
+                        bytes_forwarded, bytes_captured
+                    ));
+                }
+            } else {
+                log.response_body = Some(
+                    serde_json::to_string_pretty(&Value::Object(consolidated)).unwrap_or_else(
+                        |_| format!("[Consolidated Stream Data: {} bytes]", bytes_forwarded),
+                    ),
+                );
+            }
 
             // Fallback token extraction from tail if not already extracted
             if log.input_tokens.is_none() && log.output_tokens.is_none() {
@@ -1210,8 +1389,14 @@ pub async fn monitor_middleware(
 
             // [FIX #3325] Fallback input token estimation for stream responses
             if log.input_tokens.is_none() {
+                log.input_tokens = estimated_input_tokens;
+            }
+            if log.input_tokens.is_none() {
                 if let Some(ref req_body) = log.request_body {
-                    let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
+                    let estimated =
+                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(
+                            req_body,
+                        );
                     if estimated > 0 {
                         log.input_tokens = Some(estimated);
                     }
@@ -1221,7 +1406,7 @@ pub async fn monitor_middleware(
             // Record User Token Usage
             record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
-            monitor.log_request(log).await;
+            monitor.log_request_with_permit(log, capture_permit).await;
         });
 
         Response::from_parts(
@@ -1233,7 +1418,15 @@ pub async fn monitor_middleware(
         match axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE).await {
             Ok(bytes) => {
                 if let Ok(s) = std::str::from_utf8(&bytes) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&s) {
+                    if !logging_enabled {
+                        if let Ok(event) = serde_json::from_str::<UsageEvent>(s) {
+                            let mut usage = UsageScanner::default();
+                            usage.observe(event);
+                            log.input_tokens = usage.input;
+                            log.output_tokens = usage.output;
+                            log.cached_tokens = usage.cached;
+                        }
+                    } else if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
                         if let Some(usage) = json
                             .get("usage")
@@ -1255,7 +1448,9 @@ pub async fn monitor_middleware(
                             }
                         }
                     }
-                    if is_image_route {
+                    if !logging_enabled {
+                        log.response_body = None;
+                    } else if is_image_route {
                         log.response_body = serde_json::from_str::<Value>(&s)
                             .ok()
                             .and_then(|json| summarize_image_json_response(&json))
@@ -1273,6 +1468,9 @@ pub async fn monitor_middleware(
 
                 // [FIX #3325] Fallback input token estimation if upstream returned an error (no usage metadata)
                 if log.input_tokens.is_none() {
+                    log.input_tokens = estimated_input_tokens;
+                }
+                if log.input_tokens.is_none() {
                     if let Some(ref req_body) = log.request_body {
                         let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
                         if estimated > 0 {
@@ -1284,7 +1482,7 @@ pub async fn monitor_middleware(
                 // Record User Token Usage
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
-                monitor.log_request(log).await;
+                monitor.log_request_with_permit(log, capture_permit).await;
                 Response::from_parts(parts, Body::from(bytes))
             }
             Err(_) => {
@@ -1293,7 +1491,7 @@ pub async fn monitor_middleware(
                 // Record User Token Usage (even if too large)
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
-                monitor.log_request(log).await;
+                monitor.log_request_with_permit(log, capture_permit).await;
                 Response::from_parts(parts, Body::empty())
             }
         }
@@ -1303,7 +1501,7 @@ pub async fn monitor_middleware(
         // Record User Token Usage
         record_user_token_usage(&user_token_identity, &log, user_agent);
 
-        monitor.log_request(log).await;
+        monitor.log_request_with_permit(log, capture_permit).await;
         response
     }
 }
@@ -1376,9 +1574,7 @@ mod tests {
             .route(
                 "/echo",
                 post(|body: axum::body::Body| async move {
-                    let bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
-                        .await
-                        .unwrap();
+                    let bytes = axum::body::to_bytes(body, 50 * 1024 * 1024).await.unwrap();
                     (
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
                         axum::body::Body::from(bytes),
@@ -1423,9 +1619,7 @@ mod tests {
             .route(
                 "/echo",
                 post(|body: axum::body::Body| async move {
-                    let bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
-                        .await
-                        .unwrap();
+                    let bytes = axum::body::to_bytes(body, 50 * 1024 * 1024).await.unwrap();
                     (
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
                         axum::body::Body::from(bytes),
@@ -1498,6 +1692,142 @@ mod tests {
         assert_eq!(resp_bytes.len(), 5 * 1024 * 1024);
     }
 
+    #[test]
+    fn memory_budget_usage_scanner_handles_split_lines_without_retaining_content() {
+        let mut scanner = super::UsageScanner::default();
+        scanner.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n");
+        assert!(scanner.pending.is_empty());
+        scanner.feed(b"data: {\"usage\":{\"prompt_tokens\":42,");
+        scanner.feed(b"\"completion_tokens\":7}}\n\n");
+        assert_eq!(scanner.input, Some(42));
+        assert_eq!(scanner.output, Some(7));
+        assert!(scanner.pending.is_empty());
+    }
+
+    #[test]
+    fn memory_budget_usage_scanner_recovers_after_large_event() {
+        let mut scanner = super::UsageScanner::default();
+        scanner.feed(&vec![b'x'; 2 * 1024 * 1024]);
+        assert!(scanner.pending.capacity() <= 1024 * 1024);
+        scanner.feed(b"\ndata: {\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7}}\n");
+        assert_eq!(scanner.input, Some(42));
+        assert_eq!(scanner.output, Some(7));
+    }
+
+    #[test]
+    fn memory_budget_large_completed_event_preserves_usage() {
+        let mut scanner = super::UsageScanner::default();
+        let event = format!("data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"text\":\"{}\"}}],\"usage\":{{\"input_tokens\":321,\"output_tokens\":123}}}}}}\n", "x".repeat(2 * 1024 * 1024));
+        for chunk in event.as_bytes().chunks(8192) {
+            scanner.feed(chunk);
+        }
+        assert_eq!(scanner.input, Some(321));
+        assert_eq!(scanner.output, Some(123));
+        assert!(scanner.spill.is_none());
+        assert!(scanner.pending.capacity() <= 64 * 1024);
+    }
+
+    #[test]
+    fn memory_budget_usage_scanner_preserves_split_anthropic_usage() {
+        let mut scanner = super::UsageScanner::default();
+        scanner.feed(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":21}}}\n",
+        );
+        scanner.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n");
+        assert_eq!(scanner.input, Some(21));
+        assert_eq!(scanner.output, Some(9));
+    }
+
+    #[tokio::test]
+    async fn memory_budget_disabled_logging_forwards_without_full_response_capture() {
+        let _lock = STREAM_TEST_LOCK.lock().await;
+        let _guard = super::FailureInjectionGuard::new(super::StreamFailureInjection::FailCreate);
+        super::clear_created_temp_paths();
+        use tower::ServiceExt;
+        let monitor = std::sync::Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        let state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+        let data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: {{\"usage\":{{\"prompt_tokens\":42,\"completion_tokens\":7}}}}\n\n", "x".repeat(2 * 1024 * 1024));
+        let expected = data.clone();
+        let app = axum::Router::new()
+            .route(
+                "/disabled",
+                axum::routing::get(move || async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        data,
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::monitor_middleware,
+            ));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/disabled")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 3 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), expected.as_bytes());
+        assert!(super::get_created_temp_paths().is_empty());
+        assert!(monitor.logs.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_budget_admission_precedes_request_body_collection() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use tower::ServiceExt;
+        let _lock = STREAM_TEST_LOCK.lock().await;
+        let permits = super::LOG_CAPTURE_SLOTS.acquire_many(4).await.unwrap();
+        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        monitor.set_enabled(true);
+        let state = crate::proxy::server::AppState::create_test_state(monitor);
+        let app = axum::Router::new()
+            .route("/admission", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::monitor_middleware,
+            ));
+        let consumed = Arc::new(AtomicBool::new(false));
+        let flag = consumed.clone();
+        let body = axum::body::Body::from_stream(futures::stream::once(async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{}"))
+        }));
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/admission")
+            .body(body)
+            .unwrap();
+        let mut task = tokio::spawn(app.oneshot(request));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut task)
+                .await
+                .is_err()
+        );
+        assert!(
+            !consumed.load(Ordering::SeqCst),
+            "waiting admission must not collect the body"
+        );
+        drop(permits);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(consumed.load(Ordering::SeqCst));
+    }
+
     static STREAM_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
@@ -1505,9 +1835,9 @@ mod tests {
         let _test_guard = STREAM_TEST_LOCK.lock().await;
         super::set_stream_failure_injection(super::StreamFailureInjection::None);
         use axum::{routing::get, Router};
-        use tower::ServiceExt;
         use futures::stream;
         use std::sync::Arc;
+        use tower::ServiceExt;
 
         let _ = crate::modules::proxy_db::init_db();
         let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
@@ -1518,10 +1848,17 @@ mod tests {
         // 构造多个 chunk，总共 > 2.5 MiB
         let mut raw_chunks = Vec::new();
         for i in 0..50 {
-            let data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk_{}_{}\"}}}}]}}\n\n", i, "A".repeat(50_000));
+            let data = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk_{}_{}\"}}}}]}}\n\n",
+                i,
+                "A".repeat(50_000)
+            );
             raw_chunks.push(axum::body::Bytes::from(data));
         }
-        let tail_data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: [DONE]\n\n", marker);
+        let tail_data = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\ndata: [DONE]\n\n",
+            marker
+        );
         raw_chunks.push(axum::body::Bytes::from(tail_data));
         let chunks_arc = Arc::new(raw_chunks);
         let chunks_for_route = chunks_arc.clone();
@@ -1534,7 +1871,8 @@ mod tests {
                 get(move || {
                     let chunks = chunks_for_route.clone();
                     async move {
-                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> = (*chunks).clone().into_iter().map(Ok).collect();
+                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> =
+                            (*chunks).clone().into_iter().map(Ok).collect();
                         let stream = stream::iter(items);
                         (
                             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
@@ -1557,15 +1895,24 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
-        let client_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024).await.unwrap();
+        let client_bytes = axum::body::to_bytes(resp.into_body(), 50 * 1024 * 1024)
+            .await
+            .unwrap();
         // 1. 客户端完整数据逐字节比对
-        let expected_client_bytes: Vec<u8> = (*chunks_arc).iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(client_bytes.to_vec(), expected_client_bytes, "Client bytes must match expected stream byte-for-byte");
+        let expected_client_bytes: Vec<u8> =
+            (*chunks_arc).iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(
+            client_bytes.to_vec(),
+            expected_client_bytes,
+            "Client bytes must match expected stream byte-for-byte"
+        );
 
         let mut db_entry = None;
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered(&sse_path_find, false, 5, 0) {
+            if let Ok(logs) =
+                crate::modules::proxy_db::get_logs_filtered(&sse_path_find, false, 5, 0)
+            {
                 if let Some(l) = logs.iter().find(|l| l.url == sse_path_find) {
                     if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
                         if detail.response_body.is_some() {
@@ -1587,24 +1934,49 @@ mod tests {
             expected_business_content.push_str(&format!("chunk_{}_{}", i, "A".repeat(50_000)));
         }
         expected_business_content.push_str(marker);
-        assert_eq!(resp_text, &expected_business_content, "DB content must match full business text character-for-character");
-        assert_eq!(db_json["bytes_forwarded"].as_u64().unwrap() as usize, expected_client_bytes.len());
-        assert_eq!(db_json["bytes_captured"].as_u64().unwrap() as usize, expected_client_bytes.len());
-        assert_eq!(db_json["stream_capture_status"].as_str().unwrap(), "completed");
+        assert_eq!(
+            resp_text, &expected_business_content,
+            "DB content must match full business text character-for-character"
+        );
+        assert_eq!(
+            db_json["bytes_forwarded"].as_u64().unwrap() as usize,
+            expected_client_bytes.len()
+        );
+        assert_eq!(
+            db_json["bytes_captured"].as_u64().unwrap() as usize,
+            expected_client_bytes.len()
+        );
+        assert_eq!(
+            db_json["stream_capture_status"].as_str().unwrap(),
+            "completed"
+        );
 
         // 3. 验证内存中预览日志的容量上限与截断标识
         let mem_logs = monitor.logs.read().await;
-        let sse_log = mem_logs.iter().find(|l| l.url == sse_path_find).expect("Memory log must exist");
-        let mem_body = sse_log.response_body.as_ref().expect("Memory response_body must exist");
+        let sse_log = mem_logs
+            .iter()
+            .find(|l| l.url == sse_path_find)
+            .expect("Memory log must exist");
+        let mem_body = sse_log
+            .response_body
+            .as_ref()
+            .expect("Memory response_body must exist");
         assert!(mem_body.len() <= 16 * 1024 + 64);
         assert!(mem_body.capacity() <= 16 * 1024 + 64);
         assert!(mem_body.contains("[TRUNCATED FOR IN-MEMORY CACHE]"));
 
         // 4. 验证临时文件在正常完成后已被自动删除
         let paths = super::get_created_temp_paths();
-        assert!(!paths.is_empty(), "Large SSE stream must create temporary spill files");
+        assert!(
+            !paths.is_empty(),
+            "Large SSE stream must create temporary spill files"
+        );
         for p in &paths {
-            assert!(!p.exists(), "Temporary spill file at {:?} must be unlinked/deleted from disk after completion", p);
+            assert!(
+                !p.exists(),
+                "Temporary spill file at {:?} must be unlinked/deleted from disk after completion",
+                p
+            );
         }
     }
 
@@ -1612,9 +1984,9 @@ mod tests {
     async fn test_stream_failure_injection_does_not_break_client() {
         let _test_guard = STREAM_TEST_LOCK.lock().await;
         use axum::{routing::get, Router};
-        use tower::ServiceExt;
         use futures::stream;
         use std::sync::Arc;
+        use tower::ServiceExt;
 
         let _ = crate::modules::proxy_db::init_db();
         for mode in [
@@ -1627,102 +1999,152 @@ mod tests {
             super::clear_created_temp_paths();
             let _guard = super::FailureInjectionGuard::new(mode);
 
-        let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
-        monitor.set_enabled(true);
-        let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
+            let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+            monitor.set_enabled(true);
+            let app_state = crate::proxy::server::AppState::create_test_state(monitor.clone());
 
-        let mut raw_chunks = Vec::new();
-        for i in 0..25 {
-            let data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"part_{}_{}\"}}}}]}}\n\n", i, "X".repeat(50_000));
-            raw_chunks.push(axum::body::Bytes::from(data));
-        }
-        raw_chunks.push(axum::body::Bytes::from("data: [DONE]\n\n"));
-        let chunks = Arc::new(raw_chunks);
-        let chunks_clone = chunks.clone();
-        let fail_url = format!("/sse_fail_{:?}_{}", mode, uuid::Uuid::new_v4());
-        let fail_url_req = fail_url.clone();
-        let fail_url_find = fail_url.clone();
+            let mut raw_chunks = Vec::new();
+            for i in 0..25 {
+                let data = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"part_{}_{}\"}}}}]}}\n\n",
+                    i,
+                    "X".repeat(50_000)
+                );
+                raw_chunks.push(axum::body::Bytes::from(data));
+            }
+            raw_chunks.push(axum::body::Bytes::from("data: [DONE]\n\n"));
+            let chunks = Arc::new(raw_chunks);
+            let chunks_clone = chunks.clone();
+            let fail_url = format!("/sse_fail_{:?}_{}", mode, uuid::Uuid::new_v4());
+            let fail_url_req = fail_url.clone();
+            let fail_url_find = fail_url.clone();
 
-        let app = Router::new()
-            .route(
-                &fail_url,
-                get(move || {
-                    let c = chunks_clone.clone();
-                    async move {
-                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> = (*c).clone().into_iter().map(Ok).collect();
-                        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream::iter(items)))
-                    }
-                }),
-            )
-            .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
+            let app = Router::new()
+                .route(
+                    &fail_url,
+                    get(move || {
+                        let c = chunks_clone.clone();
+                        async move {
+                            let items: Vec<Result<axum::body::Bytes, std::io::Error>> =
+                                (*c).clone().into_iter().map(Ok).collect();
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                axum::body::Body::from_stream(stream::iter(items)),
+                            )
+                        }
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    app_state,
+                    super::monitor_middleware,
+                ));
 
-        let req = axum::http::Request::builder().method("GET").uri(&fail_url_req).body(axum::body::Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri(&fail_url_req)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
-        let client_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await.unwrap();
-        // 逐字节完整比对，彻底替换仅检查 part_0 的方式
-        let expected_client_bytes: Vec<u8> = (*chunks).iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(
-            client_bytes.to_vec(),
-            expected_client_bytes,
-            "Client must receive 100% stream bytes byte-for-byte under failure mode {:?}",
-            mode
-        );
+            let client_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap();
+            // 逐字节完整比对，彻底替换仅检查 part_0 的方式
+            let expected_client_bytes: Vec<u8> =
+                (*chunks).iter().flat_map(|b| b.to_vec()).collect();
+            assert_eq!(
+                client_bytes.to_vec(),
+                expected_client_bytes,
+                "Client must receive 100% stream bytes byte-for-byte under failure mode {:?}",
+                mode
+            );
 
-        // 验证 SQLite 中落盘了失败状态并检查准确计数
-        let mut db_entry = None;
-        for _ in 0..50 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if let Ok(logs) = crate::modules::proxy_db::get_logs_filtered(&fail_url_find, false, 5, 0) {
-                if let Some(l) = logs.iter().find(|l| l.url == fail_url_find) {
-                    if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
-                        db_entry = Some(detail);
-                        break;
+            // 验证 SQLite 中落盘了失败状态并检查准确计数
+            let mut db_entry = None;
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if let Ok(logs) =
+                    crate::modules::proxy_db::get_logs_filtered(&fail_url_find, false, 5, 0)
+                {
+                    if let Some(l) = logs.iter().find(|l| l.url == fail_url_find) {
+                        if let Ok(detail) = crate::modules::proxy_db::get_log_detail(&l.id) {
+                            db_entry = Some(detail);
+                            break;
+                        }
                     }
                 }
             }
-        }
-        let detail = db_entry.expect("DB log must be persisted on failure");
-        let body = detail.response_body.unwrap_or_default();
-        let err = detail.error.unwrap_or_default();
-        assert!(
-            body.contains("failed") || body.contains("FAILED") || err.contains("failed") || err.contains("Simulated"),
-            "Log must record failure for mode {:?}, got body={}, err={}", mode, body, err
-        );
+            let detail = db_entry.expect("DB log must be persisted on failure");
+            let body = detail.response_body.unwrap_or_default();
+            let err = detail.error.unwrap_or_default();
+            assert!(
+                body.contains("failed")
+                    || body.contains("FAILED")
+                    || err.contains("failed")
+                    || err.contains("Simulated"),
+                "Log must record failure for mode {:?}, got body={}, err={}",
+                mode,
+                body,
+                err
+            );
 
-        // 如果是中途写入失败，验证准确计数（部分成功写入之后捕获停止，但转发持续到末尾）
-        if mode == super::StreamFailureInjection::FailWrite {
-            if let Ok(db_json) = serde_json::from_str::<serde_json::Value>(&body) {
-                let fwd = db_json["bytes_forwarded"].as_u64().unwrap_or(0) as usize;
-                let cap = db_json["bytes_captured"].as_u64().unwrap_or(0) as usize;
-                assert_eq!(fwd, expected_client_bytes.len(), "Forwarded bytes must equal client bytes");
-                assert!(cap < fwd, "Captured bytes must be strictly less than forwarded on FailWrite: {} < {}", cap, fwd);
-                assert!(cap >= 1024 * 1024, "FailWrite must have successfully written > 1MB before failure, got {}", cap);
+            // 如果是中途写入失败，验证准确计数（部分成功写入之后捕获停止，但转发持续到末尾）
+            if mode == super::StreamFailureInjection::FailWrite {
+                if let Ok(db_json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    let fwd = db_json["bytes_forwarded"].as_u64().unwrap_or(0) as usize;
+                    let cap = db_json["bytes_captured"].as_u64().unwrap_or(0) as usize;
+                    assert_eq!(
+                        fwd,
+                        expected_client_bytes.len(),
+                        "Forwarded bytes must equal client bytes"
+                    );
+                    assert!(
+                        cap < fwd,
+                        "Captured bytes must be strictly less than forwarded on FailWrite: {} < {}",
+                        cap,
+                        fwd
+                    );
+                    assert!(
+                        cap >= 1024 * 1024,
+                        "FailWrite must have successfully written > 1MB before failure, got {}",
+                        cap
+                    );
+                }
             }
-        }
 
-        // 验证临时文件资源释放与清理
-        let paths = super::get_created_temp_paths();
-        if mode == super::StreamFailureInjection::FailCreate {
-            assert!(paths.is_empty(), "FailCreate must NOT create any spill files on disk");
-        } else {
-            assert!(!paths.is_empty(), "Mode {:?} must have created a spill file", mode);
-            for p in &paths {
-                assert!(!p.exists(), "Spill file at {:?} must be unlinked/deleted from disk under mode {:?}", p, mode);
+            // 验证临时文件资源释放与清理
+            let paths = super::get_created_temp_paths();
+            if mode == super::StreamFailureInjection::FailCreate {
+                assert!(
+                    paths.is_empty(),
+                    "FailCreate must NOT create any spill files on disk"
+                );
+            } else {
+                assert!(
+                    !paths.is_empty(),
+                    "Mode {:?} must have created a spill file",
+                    mode
+                );
+                for p in &paths {
+                    assert!(
+                        !p.exists(),
+                        "Spill file at {:?} must be unlinked/deleted from disk under mode {:?}",
+                        p,
+                        mode
+                    );
+                }
             }
-        }
         }
     }
-
 
     #[tokio::test]
     async fn test_client_disconnect_marks_interrupted_not_completed() {
         let _test_guard = STREAM_TEST_LOCK.lock().await;
         use axum::{routing::get, Router};
-        use tower::ServiceExt;
         use futures::{stream, StreamExt};
         use std::sync::Arc;
+        use tower::ServiceExt;
 
         let _ = crate::modules::proxy_db::init_db();
         let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
@@ -1734,7 +2156,12 @@ mod tests {
         let url_find = url.clone();
 
         let chunks: Vec<axum::body::Bytes> = (0..100)
-            .map(|i| axum::body::Bytes::from(format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk_{}\"}}}}]}}\n\n", i)))
+            .map(|i| {
+                axum::body::Bytes::from(format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk_{}\"}}}}]}}\n\n",
+                    i
+                ))
+            })
             .collect();
         let chunks_arc = Arc::new(chunks);
 
@@ -1744,14 +2171,25 @@ mod tests {
                 get(move || {
                     let c = chunks_arc.clone();
                     async move {
-                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> = (*c).clone().into_iter().map(Ok).collect();
-                        ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream::iter(items)))
+                        let items: Vec<Result<axum::body::Bytes, std::io::Error>> =
+                            (*c).clone().into_iter().map(Ok).collect();
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            axum::body::Body::from_stream(stream::iter(items)),
+                        )
                     }
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                super::monitor_middleware,
+            ));
 
-        let req = axum::http::Request::builder().method("GET").uri(&url_req).body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&url_req)
+            .body(axum::body::Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
@@ -1778,25 +2216,33 @@ mod tests {
         let body = detail.response_body.expect("Response body must exist");
         let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let status = db_json["stream_capture_status"].as_str().unwrap();
-        assert_ne!(status, "completed", "Client disconnect must NOT be marked as completed!");
-        assert_eq!(db_json["stream_termination_reason"].as_str().unwrap(), "client_cancelled");
+        assert_ne!(
+            status, "completed",
+            "Client disconnect must NOT be marked as completed!"
+        );
+        assert_eq!(
+            db_json["stream_termination_reason"].as_str().unwrap(),
+            "client_cancelled"
+        );
         assert_eq!(status, "partial");
 
         // 验证客户端断开后临时文件已被自动删除
         let paths = super::get_created_temp_paths();
         for p in &paths {
-            assert!(!p.exists(), "Temporary spill file must be unlinked/deleted from disk after client disconnect");
+            assert!(
+                !p.exists(),
+                "Temporary spill file must be unlinked/deleted from disk after client disconnect"
+            );
         }
     }
-
 
     #[tokio::test]
     async fn test_upstream_error_marks_upstream_error_not_completed() {
         let _test_guard = STREAM_TEST_LOCK.lock().await;
         use axum::{routing::get, Router};
-        use tower::ServiceExt;
         use futures::{stream, StreamExt};
         use std::sync::Arc;
+        use tower::ServiceExt;
 
         let _ = crate::modules::proxy_db::init_db();
         let monitor = Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
@@ -1812,22 +2258,40 @@ mod tests {
                 &url,
                 get(|| async move {
                     let items = vec![
-                        Ok(axum::body::Bytes::from("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")),
-                        Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Upstream died unexpectedly")),
+                        Ok(axum::body::Bytes::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+                        )),
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "Upstream died unexpectedly",
+                        )),
                     ];
-                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream::iter(items)))
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        axum::body::Body::from_stream(stream::iter(items)),
+                    )
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(app_state, super::monitor_middleware));
+            .layer(axum::middleware::from_fn_with_state(
+                app_state,
+                super::monitor_middleware,
+            ));
 
-        let req = axum::http::Request::builder().method("GET").uri(&url_req).body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&url_req)
+            .body(axum::body::Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         let mut body_stream = resp.into_body().into_data_stream();
         let _ = body_stream.next().await;
         let second = body_stream.next().await;
-        assert!(second.is_some() && second.unwrap().is_err(), "Client must observe upstream error");
+        assert!(
+            second.is_some() && second.unwrap().is_err(),
+            "Client must observe upstream error"
+        );
 
         let mut db_entry = None;
         for _ in 0..50 {
@@ -1847,15 +2311,23 @@ mod tests {
         let body = detail.response_body.expect("Response body must exist");
         let db_json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let status = db_json["stream_capture_status"].as_str().unwrap();
-        assert_ne!(status, "completed", "Upstream error must NOT be marked as completed!");
-        assert_eq!(db_json["stream_termination_reason"].as_str().unwrap(), "upstream_error");
+        assert_ne!(
+            status, "completed",
+            "Upstream error must NOT be marked as completed!"
+        );
+        assert_eq!(
+            db_json["stream_termination_reason"].as_str().unwrap(),
+            "upstream_error"
+        );
         assert_eq!(status, "partial");
 
         // 验证上游错误后临时文件已被自动删除
         let paths = super::get_created_temp_paths();
         for p in &paths {
-            assert!(!p.exists(), "Temporary spill file must be unlinked/deleted from disk after upstream error");
+            assert!(
+                !p.exists(),
+                "Temporary spill file must be unlinked/deleted from disk after upstream error"
+            );
         }
     }
-
 }

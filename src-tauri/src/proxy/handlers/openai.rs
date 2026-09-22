@@ -1245,6 +1245,28 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
     }
 
     #[tokio::test]
+    async fn missing_previous_response_returns_explicit_error() {
+        use super::{handle_completions, AppState};
+        use axum::{extract::State, http::StatusCode, Json};
+        let monitor = std::sync::Arc::new(crate::proxy::monitor::ProxyMonitor::new(10, None));
+        let state = AppState::create_test_state(monitor);
+        let response = handle_completions(
+            axum::extract::OriginalUri("/v1/responses".parse().unwrap()),
+            State(state),
+            Json(json!({
+                "model": "gemini-pro-agent",
+                "input": "continue",
+                "previous_response_id": format!("missing-{}", uuid::Uuid::new_v4())
+            })),
+        ).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "previous_response_not_found");
+        assert_eq!(body["error"]["param"], "previous_response_id");
+    }
+
+    #[tokio::test]
     async fn cancelled_response_drops_pending_session_save() {
         let response_id = format!("resp-cancelled-{}", uuid::Uuid::new_v4());
         let save_response_id = response_id.clone();
@@ -2968,10 +2990,14 @@ pub async fn handle_completions(
                 );
                 prepared.merged
             } else {
-                if store_response {
-                    session_delta_input = existing_input.clone();
-                }
-                existing_input
+                return (StatusCode::BAD_REQUEST, Json(json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "previous_response_not_found",
+                        "param": "previous_response_id",
+                        "message": "Previous response is unavailable or expired. Resend the complete input without previous_response_id."
+                    }
+                }))).into_response();
             }
         } else {
             if store_response {
@@ -3828,7 +3854,7 @@ pub async fn handle_completions(
                             headers,
                             format!("Token error: {}", e),
                         )
-                            .into_response()
+                            .into_response();
                     }
                 }
             };
@@ -7263,10 +7289,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 再插入 call_to_refresh，后续通过读取刷新访问时间
-        insert_cached_tool_call(
-            "call_to_refresh".to_string(),
-            json!({ "index": "refresh" }),
-        );
+        insert_cached_tool_call("call_to_refresh".to_string(), json!({ "index": "refresh" }));
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 填充至 TOOL_CALL_CACHE_CAP (还需插入 TOOL_CALL_CACHE_CAP - 2 项)

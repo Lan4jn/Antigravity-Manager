@@ -132,6 +132,14 @@ impl ProxyMonitor {
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
+        self.log_request_with_permit(log, None).await;
+    }
+
+    pub(crate) async fn log_request_with_permit(
+        &self,
+        log: ProxyRequestLog,
+        permit: Option<tokio::sync::SemaphorePermit<'static>>,
+    ) {
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
@@ -175,7 +183,10 @@ impl ProxyMonitor {
                 mapped_model: log.mapped_model.clone(),
                 account_email: log.account_email.clone(),
                 client_ip: log.client_ip.clone(),
-                error: log.error.clone(),
+                error: log
+                    .error
+                    .as_deref()
+                    .map(|s| truncate_str_safe(s, MAX_MEMORY_BODY_BYTES)),
                 request_body: log
                     .request_body
                     .as_deref()
@@ -198,9 +209,39 @@ impl ProxyMonitor {
             logs.push_front(memory_log);
         }
 
+        // Emit event (send summary only, without body to reduce memory)
+        if let Some(app) = &self.app_handle {
+            let log_summary = ProxyRequestLog {
+                id: log.id.clone(),
+                timestamp: log.timestamp,
+                method: log.method.clone(),
+                url: log.url.clone(),
+                status: log.status,
+                duration: log.duration,
+                model: log.model.clone(),
+                mapped_model: log.mapped_model.clone(),
+                account_email: log.account_email.clone(),
+                client_ip: log.client_ip.clone(),
+                error: log
+                    .error
+                    .as_deref()
+                    .map(|s| truncate_str_safe(s, MAX_MEMORY_BODY_BYTES)),
+                request_body: None,  // Don't send body in event
+                response_body: None, // Don't send body in event
+                input_tokens: log.input_tokens,
+                output_tokens: log.output_tokens,
+                cached_tokens: log.cached_tokens,
+                protocol: log.protocol.clone(),
+                username: log.username.clone(),
+            };
+            let _ = app.emit("proxy://request", &log_summary);
+        }
         // Save to DB
-        let log_to_save = log.clone();
+        let log_to_save = log;
         tokio::task::spawn_blocking(move || {
+            // Cancellation of the awaiting request must not release admission
+            // while this blocking writer still owns the full body.
+            let _permit = permit;
             if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
                 tracing::error!("Failed to save proxy log to DB: {}", e);
             }
@@ -226,32 +267,9 @@ impl ProxyMonitor {
                     tracing::error!("Failed to save security log: {}", e);
                 }
             }
-        });
-
-        // Emit event (send summary only, without body to reduce memory)
-        if let Some(app) = &self.app_handle {
-            let log_summary = ProxyRequestLog {
-                id: log.id.clone(),
-                timestamp: log.timestamp,
-                method: log.method.clone(),
-                url: log.url.clone(),
-                status: log.status,
-                duration: log.duration,
-                model: log.model.clone(),
-                mapped_model: log.mapped_model.clone(),
-                account_email: log.account_email.clone(),
-                client_ip: log.client_ip.clone(),
-                error: log.error.clone(),
-                request_body: None,  // Don't send body in event
-                response_body: None, // Don't send body in event
-                input_tokens: log.input_tokens,
-                output_tokens: log.output_tokens,
-                cached_tokens: log.cached_tokens,
-                protocol: log.protocol.clone(),
-                username: log.username.clone(),
-            };
-            let _ = app.emit("proxy://request", &log_summary);
-        }
+        })
+        .await
+        .unwrap_or_else(|error| tracing::error!("Proxy log writer failed: {}", error));
     }
 
     pub async fn get_logs(&self, limit: usize) -> Vec<ProxyRequestLog> {
@@ -338,7 +356,10 @@ mod tests {
         let orig_10m = "A".repeat(10 * 1024 * 1024);
         let prev_10m = truncate_str_safe(&orig_10m, MAX_MEMORY_BODY_BYTES);
         assert!(prev_10m.ends_with(TRUNCATION_SUFFIX));
-        assert_eq!(prev_10m.len(), MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
+        assert_eq!(
+            prev_10m.len(),
+            MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len()
+        );
         assert!(prev_10m.capacity() <= MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
         assert_eq!(orig_10m.len(), 10 * 1024 * 1024, "原 10 MiB 正文不被修改");
 
@@ -392,7 +413,7 @@ mod tests {
             cached_tokens: None,
             protocol: None,
             username: None,
-            error: None,
+            error: Some("E".repeat(1024 * 1024)),
         };
 
         monitor.log_request(log1.clone()).await;
@@ -401,6 +422,10 @@ mod tests {
             let logs = monitor.logs.read().await;
             assert_eq!(logs.len(), 1);
             let first = &logs[0];
+            assert!(
+                first.error.as_ref().unwrap().capacity()
+                    <= MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len()
+            );
             assert!(first.request_body.as_ref().unwrap().contains("[TRUNCATED"));
             assert!(first.response_body.as_ref().unwrap().contains("[TRUNCATED"));
         }
@@ -468,14 +493,31 @@ mod tests {
         // 验证内存中保留的是截断预览
         {
             let logs = monitor.logs.read().await;
-            let mem_entry = logs.iter().find(|l| l.id == unique_id).expect("Memory entry must exist");
-            assert!(mem_entry.request_body.as_ref().unwrap().contains("[TRUNCATED"));
-            assert!(mem_entry.response_body.as_ref().unwrap().contains("[TRUNCATED"));
+            let mem_entry = logs
+                .iter()
+                .find(|l| l.id == unique_id)
+                .expect("Memory entry must exist");
+            assert!(mem_entry
+                .request_body
+                .as_ref()
+                .unwrap()
+                .contains("[TRUNCATED"));
+            assert!(mem_entry
+                .response_body
+                .as_ref()
+                .unwrap()
+                .contains("[TRUNCATED"));
         }
 
         // 验证从 SQLite 数据库读回的是未截断的完整正文
-        assert_eq!(db_detail.request_body.as_deref(), Some(full_req_body.as_str()));
-        assert_eq!(db_detail.response_body.as_deref(), Some(full_resp_body.as_str()));
+        assert_eq!(
+            db_detail.request_body.as_deref(),
+            Some(full_req_body.as_str())
+        );
+        assert_eq!(
+            db_detail.response_body.as_deref(),
+            Some(full_resp_body.as_str())
+        );
     }
 
     #[tokio::test]

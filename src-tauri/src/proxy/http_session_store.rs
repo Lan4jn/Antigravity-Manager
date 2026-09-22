@@ -5,11 +5,16 @@
 use crate::proxy::handlers::openai::get_cached_tool_call;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const SESSION_TTL_SECS: u64 = 3600; // 1小时过期
+const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CHAIN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SESSIONS: usize = 1000;
+// Bound both materialization work and recursive Arc destruction.
+const MAX_CHAIN_NODES: usize = 1000;
 
 #[derive(Debug, Clone)]
 pub struct HttpSessionEntry {
@@ -31,6 +36,9 @@ struct SessionNode {
     instructions: String,
     model: String,
     routing_session_id: String,
+    retained_bytes: usize,
+    chain_bytes: usize,
+    chain_nodes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -49,16 +57,31 @@ struct StoredSession {
 
 struct HttpSessionStore {
     sessions: HashMap<String, StoredSession>,
+    // Weak entries account for nodes held by in-flight requests even after index eviction.
+    nodes: Vec<Weak<SessionNode>>,
+    max_bytes: usize,
+    max_chain_bytes: usize,
+    max_sessions: usize,
 }
 
 impl HttpSessionStore {
     fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            nodes: Vec::new(),
+            max_bytes: MAX_SESSION_BYTES,
+            max_chain_bytes: MAX_CHAIN_BYTES,
+            max_sessions: MAX_SESSIONS,
         }
     }
 
     fn get(&mut self, response_id: &str) -> Option<(HttpSessionEntry, SessionParent)> {
+        if self.sessions.get(response_id)?.last_accessed.elapsed()
+            >= Duration::from_secs(SESSION_TTL_SECS)
+        {
+            self.sessions.remove(response_id);
+            return None;
+        }
         let stored = self.sessions.get_mut(response_id)?;
         stored.last_accessed = Instant::now();
         let node = stored.node.clone();
@@ -95,30 +118,121 @@ impl HttpSessionStore {
         model: String,
         routing_session_id: Option<String>,
     ) {
+        self.evict_expired();
         let routing_session_id = routing_session_id.unwrap_or_else(|| response_id.clone());
+        let retained_bytes = std::mem::size_of::<SessionNode>()
+            + 2 * std::mem::size_of::<usize>()
+            + values_heap_bytes(&input_delta)
+            + values_heap_bytes(&response_output)
+            + instructions.capacity()
+            + model.capacity()
+            + routing_session_id.capacity();
+        let chain_bytes =
+            retained_bytes.saturating_add(parent.as_ref().map_or(0, |parent| parent.0.chain_bytes));
+        let chain_nodes = 1 + parent.as_ref().map_or(0, |parent| parent.0.chain_nodes);
+        if chain_bytes > self.max_chain_bytes || chain_nodes > MAX_CHAIN_NODES {
+            tracing::warn!(
+                "Responses history exceeds retention budget; response will not be stored"
+            );
+            return;
+        }
+        let index_bytes = response_id.capacity()
+            + std::mem::size_of::<StoredSession>()
+            + std::mem::size_of::<String>();
+        // Replacements must not keep the old index entry alive while making room.
+        self.sessions.remove(&response_id);
+        while self.sessions.len() >= self.max_sessions
+            || self
+                .retained_bytes()
+                .saturating_add(retained_bytes + index_bytes)
+                > self.max_bytes
+        {
+            let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, stored)| stored.last_accessed)
+                .map(|(id, _)| id.clone())
+            else {
+                // Active SessionParent handles cannot be evicted. Refuse additional
+                // storage instead of exceeding the budget or truncating their history.
+                tracing::warn!(
+                    "Responses history budget held by active requests; response will not be stored"
+                );
+                return;
+            };
+            self.sessions.remove(&oldest);
+        }
+        let node = Arc::new(SessionNode {
+            parent: parent.map(|parent| parent.0),
+            input_delta,
+            response_output,
+            instructions,
+            model,
+            routing_session_id,
+            retained_bytes,
+            chain_bytes,
+            chain_nodes,
+        });
+        self.nodes.push(Arc::downgrade(&node));
         self.sessions.insert(
             response_id,
             StoredSession {
-                node: Arc::new(SessionNode {
-                    parent: parent.map(|parent| parent.0),
-                    input_delta,
-                    response_output,
-                    instructions,
-                    model,
-                    routing_session_id,
-                }),
+                node,
                 last_accessed: Instant::now(),
             },
         );
-        // 顺便淘汰过期 session（惰性清理）
-        self.evict_expired();
+    }
+
+    /// Estimated retained heap, not RSS. Each node is registered once, so shared
+    /// ancestors are counted once, including those reachable only from active handles.
+    fn retained_bytes(&mut self) -> usize {
+        self.nodes.retain(|node| node.strong_count() > 0);
+        self.nodes
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|node| node.retained_bytes)
+            .sum::<usize>()
+            + self
+                .sessions
+                .keys()
+                .map(|id| {
+                    id.capacity()
+                        + std::mem::size_of::<StoredSession>()
+                        + std::mem::size_of::<String>()
+                })
+                .sum::<usize>()
     }
 
     fn evict_expired(&mut self) {
         let ttl = Duration::from_secs(SESSION_TTL_SECS);
         self.sessions
             .retain(|_, stored| stored.last_accessed.elapsed() < ttl);
+        self.nodes.retain(|node| node.strong_count() > 0);
     }
+}
+
+// Include allocation capacity, not serialized length. Object-node overhead is
+// deliberately conservative; allocator bookkeeping and request copies are outside
+// this store's estimated byte budget.
+fn value_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(values) => values_heap_bytes(values),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                key.capacity()
+                    + 4 * std::mem::size_of::<(String, Value)>()
+                    + value_heap_bytes(value)
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn values_heap_bytes(values: &Vec<Value>) -> usize {
+    values.capacity() * std::mem::size_of::<Value>()
+        + values.iter().map(value_heap_bytes).sum::<usize>()
 }
 
 fn materialize_history(node: &Arc<SessionNode>) -> Vec<Value> {
@@ -145,6 +259,13 @@ static STORE: OnceLock<Mutex<HttpSessionStore>> = OnceLock::new();
 
 fn store() -> &'static Mutex<HttpSessionStore> {
     STORE.get_or_init(|| Mutex::new(HttpSessionStore::new()))
+}
+
+/// Called by the proxy's cancellable maintenance loop, including while idle.
+pub async fn cleanup_expired_sessions() {
+    if let Some(store) = STORE.get() {
+        store.lock().await.evict_expired();
+    }
 }
 
 /// 根据 previous_response_id 查找历史会话
@@ -482,6 +603,91 @@ mod tests {
     }
 
     #[test]
+    fn expired_lookup_does_not_revive_session() {
+        let mut store = HttpSessionStore::new();
+        store.insert("expired".into(), entry("old"));
+        store.sessions.get_mut("expired").unwrap().last_accessed =
+            Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+        assert!(store.get("expired").is_none());
+        assert!(!store.sessions.contains_key("expired"));
+    }
+
+    #[test]
+    fn session_index_evicts_least_recently_used() {
+        let mut store = HttpSessionStore::new();
+        for i in 0..1000 {
+            store.insert(format!("response-{i}"), entry("small"));
+        }
+        store.get("response-0").unwrap();
+        store.insert("new".into(), entry("small"));
+        assert_eq!(store.sessions.len(), 1000);
+        assert!(store.get("response-0").is_some());
+        assert!(store.get("response-1").is_none());
+    }
+
+    #[test]
+    fn oversized_history_is_not_stored_or_truncated() {
+        let mut store = HttpSessionStore::new();
+        store.insert("oversized".into(), entry(&"x".repeat(17 * 1024 * 1024)));
+        assert!(store.get("oversized").is_none());
+    }
+
+    #[test]
+    fn evicted_ancestor_remains_accounted_until_active_parent_drops() {
+        let mut store = HttpSessionStore::new();
+        store.max_bytes = 16 * 1024;
+        store.max_chain_bytes = 16 * 1024;
+        store.max_sessions = 1;
+        let mut root = entry("root");
+        root.input_items = vec![json!("r".repeat(6000))];
+        store.insert("root".into(), root);
+        let (_, parent) = store.get("root").unwrap();
+        let weak = Arc::downgrade(&parent.0);
+        store.insert_delta(
+            "child".into(),
+            Some(parent),
+            vec![json!("c".repeat(2000))],
+            Vec::new(),
+            String::new(),
+            String::new(),
+            None,
+        );
+        assert!(!store.sessions.contains_key("root"));
+        let (history, active) = store.get("child").unwrap();
+        assert_eq!(history.input_items.len(), 2);
+        assert!(store.retained_bytes() >= 8000);
+        store.sessions.get_mut("child").unwrap().last_accessed =
+            Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+        store.evict_expired();
+        assert!(store.sessions.is_empty());
+        assert!(weak.upgrade().is_some());
+        assert!(store.retained_bytes() >= 8000);
+        drop(active);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(store.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn active_parents_cannot_bypass_global_budget() {
+        let mut store = HttpSessionStore::new();
+        store.max_bytes = 12 * 1024;
+        store.max_chain_bytes = 12 * 1024;
+        let mut held = Vec::new();
+        for i in 0..20 {
+            let id = format!("response-{i}");
+            store.insert(id.clone(), entry(&"x".repeat(4000)));
+            if let Some((_, parent)) = store.get(&id) {
+                held.push(parent);
+            }
+            assert!(store.retained_bytes() <= store.max_bytes);
+        }
+        assert!(held.len() < 20);
+        store.sessions.clear();
+        drop(held);
+        assert_eq!(store.retained_bytes(), 0);
+    }
+
+    #[test]
     fn responses_store_false_restores_full_input_without_retaining_delta() {
         let history = vec![
             json!({"id": "old", "role": "user", "content": "x".repeat(32768)}),
@@ -570,6 +776,20 @@ mod tests {
             String::new(),
             Some("routing-root".to_string()),
         );
+
+        let unique_nodes_bytes: usize = store
+            .sessions
+            .values()
+            .map(|stored| stored.node.retained_bytes)
+            .sum();
+        let index_bytes: usize = store
+            .sessions
+            .keys()
+            .map(|id| {
+                id.capacity() + std::mem::size_of::<StoredSession>() + std::mem::size_of::<String>()
+            })
+            .sum();
+        assert_eq!(store.retained_bytes(), unique_nodes_bytes + index_bytes);
 
         let parent_a = store.sessions["resp-a"].node.parent.as_ref().unwrap();
         let parent_b = store.sessions["resp-b"].node.parent.as_ref().unwrap();

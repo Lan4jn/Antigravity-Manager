@@ -72,6 +72,40 @@ where
     }
 }
 
+// Payload capacity budgets across four layers total 32 MiB. Map metadata is separate.
+const TOOL_BYTES: usize = 2 * 1024 * 1024;
+const FAMILY_BYTES: usize = 2 * 1024 * 1024;
+const SESSION_BYTES: usize = 24 * 1024 * 1024;
+const REASONING_BYTES: usize = 4 * 1024 * 1024;
+
+fn enforce_bytes<T>(
+    cache: &mut HashMap<String, CacheEntry<T>>,
+    budget: usize,
+    size: impl Fn(&T) -> usize,
+) {
+    cache.retain(|_, entry| !entry.is_expired());
+    let mut total: usize = cache
+        .iter()
+        .map(|(k, v)| k.capacity().saturating_add(size(&v.data)))
+        .sum();
+    if total <= budget {
+        return;
+    }
+    let mut oldest: Vec<_> = cache
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_accessed))
+        .collect();
+    oldest.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    for (key, _) in oldest {
+        if total <= budget {
+            break;
+        }
+        if let Some((key, entry)) = cache.remove_entry(&key) {
+            total = total.saturating_sub(key.capacity().saturating_add(size(&entry.data)));
+        }
+    }
+}
+
 /// Triple-layer signature cache to handle:
 /// 1. Signature recovery for tool calls (when clients strip them)
 /// 2. Cross-model compatibility checks (preventing Claude signatures on Gemini models)
@@ -126,7 +160,14 @@ impl SignatureCache {
                 "[SignatureCache] Caching tool signature for id: {}",
                 tool_use_id
             );
-            cache.insert(tool_use_id.to_string(), CacheEntry::new(signature));
+            if tool_use_id.len().saturating_add(signature.len()) > TOOL_BYTES {
+                return;
+            }
+            cache.insert(
+                tool_use_id.to_string(),
+                CacheEntry::new(signature.as_str().to_owned()),
+            );
+            enforce_bytes(&mut cache, TOOL_BYTES, String::capacity);
 
             // Clean up expired entries and enforce capacity limit via LRU eviction
             if cache.len() > TOOL_CACHE_LIMIT {
@@ -174,7 +215,14 @@ impl SignatureCache {
                 signature.len(),
                 family
             );
-            cache.insert(signature, CacheEntry::new(family));
+            if signature.len().saturating_add(family.len()) > FAMILY_BYTES {
+                return;
+            }
+            cache.insert(
+                signature.as_str().to_owned(),
+                CacheEntry::new(family.as_str().to_owned()),
+            );
+            enforce_bytes(&mut cache, FAMILY_BYTES, String::capacity);
 
             if cache.len() > FAMILY_CACHE_LIMIT {
                 let before = cache.len();
@@ -233,7 +281,9 @@ impl SignatureCache {
         }
 
         // 单条签名过大防护：超过会话总预算则拒绝（不截断）
-        if signature.len() > SESSION_SIGNATURE_HISTORY_BYTES {
+        if signature.len() > SESSION_SIGNATURE_HISTORY_BYTES
+            || session_id.len().saturating_add(signature.len()) > SESSION_BYTES
+        {
             tracing::warn!(
                 "[SignatureCache] Signature for session {} exceeds budget ({} bytes), rejecting",
                 session_id,
@@ -305,7 +355,8 @@ impl SignatureCache {
                 // 双预算淘汰（spec G4）：轮次上限 + 字节上限，优先淘汰最早 message_count
                 loop {
                     let turn_ok = entry.data.len() <= SESSION_SIGNATURE_HISTORY_LIMIT;
-                    let bytes_total: usize = entry.data.values().map(|e| e.signature.capacity()).sum();
+                    let bytes_total: usize =
+                        entry.data.values().map(|e| e.signature.capacity()).sum();
                     let bytes_ok = bytes_total <= SESSION_SIGNATURE_HISTORY_BYTES;
                     if turn_ok && bytes_ok {
                         break;
@@ -318,6 +369,9 @@ impl SignatureCache {
                 }
             }
 
+            enforce_bytes(&mut cache, SESSION_BYTES, |history| {
+                history.values().map(|e| e.signature.capacity()).sum()
+            });
             // Cleanup when limit is reached (Session cache has largest limit)
             if cache.len() > SESSION_CACHE_LIMIT {
                 let before = cache.len();
@@ -409,7 +463,9 @@ impl SignatureCache {
         }
 
         // P1 目标 1: 超预算 reasoning 前置校验！在任何缓存插入或分配之前拒绝！
-        if reasoning.len() > MAX_REASONING_BYTES {
+        if reasoning.len() > MAX_REASONING_BYTES
+            || session_id.len().saturating_add(reasoning.len()) > REASONING_BYTES
+        {
             tracing::warn!(
                 "[SignatureCache] Reasoning for session {} turn {} exceeds max bytes ({} > {}), rejecting",
                 session_id,
@@ -457,6 +513,9 @@ impl SignatureCache {
                 entry.data[turn_index] = compact_reasoning;
             }
 
+            enforce_bytes(&mut cache, REASONING_BYTES, |history| {
+                history.iter().map(String::capacity).sum()
+            });
             // Session cache cleanup if limit exceeded
             if cache.len() > SESSION_CACHE_LIMIT {
                 let before = cache.len();
@@ -517,6 +576,26 @@ impl SignatureCache {
                 );
             }
         }
+    }
+
+    /// Called by the cancellable proxy maintenance loop, including during idle periods.
+    pub fn evict_expired(&self) {
+        self.tool_signatures
+            .lock()
+            .unwrap()
+            .retain(|_, e| !e.is_expired());
+        self.thinking_families
+            .lock()
+            .unwrap()
+            .retain(|_, e| !e.is_expired());
+        self.session_signatures
+            .lock()
+            .unwrap()
+            .retain(|_, e| !e.is_expired());
+        self.session_reasonings
+            .lock()
+            .unwrap()
+            .retain(|_, e| !e.is_expired());
     }
 
     /// Clear all caches (for testing or manual reset)
@@ -621,6 +700,57 @@ impl SignatureCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_budget_idle_cleanup_releases_all_signature_layers() {
+        let cache = super::SignatureCache::new();
+        cache.cache_tool_signature("tool", "s".repeat(60));
+        cache.cache_thinking_family("s".repeat(60), "family".into());
+        cache.cache_session_signature("session", "s".repeat(60), 1);
+        cache.cache_session_reasoning("session", "reasoning".into(), 0);
+        let expired =
+            std::time::SystemTime::now() - super::SIGNATURE_TTL - std::time::Duration::from_secs(1);
+        for e in cache.tool_signatures.lock().unwrap().values_mut() {
+            e.created_at = expired;
+        }
+        for e in cache.thinking_families.lock().unwrap().values_mut() {
+            e.created_at = expired;
+        }
+        for e in cache.session_signatures.lock().unwrap().values_mut() {
+            e.created_at = expired;
+        }
+        for e in cache.session_reasonings.lock().unwrap().values_mut() {
+            e.created_at = expired;
+        }
+        cache.evict_expired();
+        assert!(cache.tool_signatures.lock().unwrap().is_empty());
+        assert!(cache.thinking_families.lock().unwrap().is_empty());
+        assert!(cache.session_signatures.lock().unwrap().is_empty());
+        assert!(cache.session_reasonings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn memory_budget_session_cache_is_globally_bounded() {
+        let cache = super::SignatureCache::new();
+        for i in 0..40 {
+            cache.cache_session_signature(&format!("budget-{i}"), "s".repeat(1024 * 1024), 1);
+        }
+        let entries = cache.session_signatures.lock().unwrap();
+        let bytes: usize = entries
+            .values()
+            .flat_map(|e| e.data.values())
+            .map(|e| e.signature.capacity())
+            .sum();
+        assert!(bytes <= 24 * 1024 * 1024, "retained {bytes} bytes");
+        assert!(entries.contains_key("budget-39"));
+    }
+
+    #[test]
+    fn memory_budget_rejects_oversized_tool_signature() {
+        let cache = super::SignatureCache::new();
+        cache.cache_tool_signature("large", "s".repeat(3 * 1024 * 1024));
+        assert!(cache.get_tool_signature("large").is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -860,7 +990,9 @@ mod tests {
         // 最旧的第 1 轮应该已被移除
         assert!(!session_entry.data.contains_key(&1));
         // 最新的最后一轮应该存在
-        assert!(session_entry.data.contains_key(&(SESSION_SIGNATURE_HISTORY_LIMIT + 10)));
+        assert!(session_entry
+            .data
+            .contains_key(&(SESSION_SIGNATURE_HISTORY_LIMIT + 10)));
     }
 
     #[test]
@@ -936,13 +1068,19 @@ mod tests {
     fn test_session_signature_turn_miss_does_not_refresh_touch() {
         let cache = SignatureCache::new();
         cache.cache_session_signature("sess_miss", "x".repeat(60), 1);
-        let t0 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        let t0 = cache
+            .get_session_signature_last_accessed("sess_miss")
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(cache.get_session_signature_at("sess_miss", 999), None);
-        let t1 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        let t1 = cache
+            .get_session_signature_last_accessed("sess_miss")
+            .unwrap();
         assert_eq!(t0, t1, "Turn miss must NOT refresh last_accessed");
         assert!(cache.get_session_signature_at("sess_miss", 1).is_some());
-        let t2 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        let t2 = cache
+            .get_session_signature_last_accessed("sess_miss")
+            .unwrap();
         assert!(t2 > t1, "Turn hit MUST refresh last_accessed");
     }
 
@@ -985,17 +1123,34 @@ mod tests {
     fn test_oversized_reasoning_does_not_modify_existing_session() {
         let cache = SignatureCache::new();
         cache.append_reasoning("sess_exist", "valid reasoning 0".to_string(), 0);
-        let orig_created = cache.get_session_reasoning_created_at("sess_exist").unwrap();
-        let orig_len = cache.get_session_reasoning_history_len("sess_exist").unwrap();
+        let orig_created = cache
+            .get_session_reasoning_created_at("sess_exist")
+            .unwrap();
+        let orig_len = cache
+            .get_session_reasoning_history_len("sess_exist")
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let huge = "r".repeat(MAX_REASONING_BYTES + 100);
         cache.append_reasoning("sess_exist", huge, 1);
 
-        assert_eq!(cache.get_session_reasoning("sess_exist", 0), Some("valid reasoning 0".to_string()));
+        assert_eq!(
+            cache.get_session_reasoning("sess_exist", 0),
+            Some("valid reasoning 0".to_string())
+        );
         assert_eq!(cache.get_session_reasoning("sess_exist", 1), None);
-        assert_eq!(cache.get_session_reasoning_history_len("sess_exist").unwrap(), orig_len);
-        assert_eq!(cache.get_session_reasoning_created_at("sess_exist").unwrap(), orig_created);
+        assert_eq!(
+            cache
+                .get_session_reasoning_history_len("sess_exist")
+                .unwrap(),
+            orig_len
+        );
+        assert_eq!(
+            cache
+                .get_session_reasoning_created_at("sess_exist")
+                .unwrap(),
+            orig_created
+        );
     }
 
     #[test]
@@ -1007,13 +1162,20 @@ mod tests {
 
         // 有效写入刷新 TTL
         cache.append_reasoning("sess_r_ttl", "reasoning 1 longer".to_string(), 1);
-        let new_created = cache.get_session_reasoning_created_at("sess_r_ttl").unwrap();
-        assert!(new_created.elapsed().unwrap().as_secs() < 5, "Reasoning valid write MUST refresh TTL");
+        let new_created = cache
+            .get_session_reasoning_created_at("sess_r_ttl")
+            .unwrap();
+        assert!(
+            new_created.elapsed().unwrap().as_secs() < 5,
+            "Reasoning valid write MUST refresh TTL"
+        );
 
         // 读取命中不延长 TTL
         cache.inject_session_reasoning_created_at("sess_r_ttl", old_time);
         assert!(cache.get_session_reasoning("sess_r_ttl", 1).is_some());
-        let read_created = cache.get_session_reasoning_created_at("sess_r_ttl").unwrap();
+        let read_created = cache
+            .get_session_reasoning_created_at("sess_r_ttl")
+            .unwrap();
         assert_eq!(read_created, old_time, "Read must NOT extend TTL");
     }
 
@@ -1029,13 +1191,19 @@ mod tests {
         let shorter = "y".repeat(60);
         cache.cache_session_signature("sess_rej", shorter, 1);
         let after_time = cache.get_session_signature_created_at("sess_rej").unwrap();
-        assert_eq!(after_time, old_time, "Rejected same-turn shorter write must NOT refresh TTL");
+        assert_eq!(
+            after_time, old_time,
+            "Rejected same-turn shorter write must NOT refresh TTL"
+        );
 
         // 单条超 1 MiB 签名被拒绝，不得刷新 TTL
         let oversized = "z".repeat(SESSION_SIGNATURE_HISTORY_BYTES + 10);
         cache.cache_session_signature("sess_rej", oversized, 2);
         let after_oversized = cache.get_session_signature_created_at("sess_rej").unwrap();
-        assert_eq!(after_oversized, old_time, "Rejected oversized signature must NOT refresh TTL");
+        assert_eq!(
+            after_oversized, old_time,
+            "Rejected oversized signature must NOT refresh TTL"
+        );
     }
 
     #[test]
@@ -1065,7 +1233,14 @@ mod tests {
         }
 
         // 验证硬上限 256 轮
-        let count = cache.session_signatures.lock().unwrap().get("sess_10k").unwrap().data.len();
+        let count = cache
+            .session_signatures
+            .lock()
+            .unwrap()
+            .get("sess_10k")
+            .unwrap()
+            .data
+            .len();
         assert_eq!(count, SESSION_SIGNATURE_HISTORY_LIMIT);
         assert!(count <= 256);
 
@@ -1086,18 +1261,27 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 访问 sig_a 提升其为活跃项
-        assert_eq!(cache.get_signature_family(&sig_a), Some("family_a".to_string()));
+        assert_eq!(
+            cache.get_signature_family(&sig_a),
+            Some("family_a".to_string())
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 填满超额 1 项
         for i in 0..(FAMILY_CACHE_LIMIT - 1) {
-            cache.set_thinking_family(format!("sig_fill_{}_{}", i, "x".repeat(60)), format!("fam_{}", i));
+            cache.set_thinking_family(
+                format!("sig_fill_{}_{}", i, "x".repeat(60)),
+                format!("fam_{}", i),
+            );
         }
 
         assert_eq!(cache.family_cache_len(), FAMILY_CACHE_LIMIT);
         // sig_b 未被访问，早于 sig_a 淘汰
         assert_eq!(cache.get_signature_family(&sig_b), None);
-        assert_eq!(cache.get_signature_family(&sig_a), Some("family_a".to_string()));
+        assert_eq!(
+            cache.get_signature_family(&sig_a),
+            Some("family_a".to_string())
+        );
     }
 
     #[test]
@@ -1132,17 +1316,27 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 访问 reas_lru_a 提升活跃度
-        assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
+        assert_eq!(
+            cache.get_session_reasoning("reas_lru_a", 0),
+            Some("reasoning a".to_string())
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 填满超额 1 项
         for i in 0..(SESSION_CACHE_LIMIT - 1) {
-            cache.append_reasoning(&format!("reas_fill_{}", i), format!("reasoning fill {}", i), 0);
+            cache.append_reasoning(
+                &format!("reas_fill_{}", i),
+                format!("reasoning fill {}", i),
+                0,
+            );
         }
 
         assert_eq!(cache.reasoning_cache_len(), SESSION_CACHE_LIMIT);
         assert_eq!(cache.get_session_reasoning("reas_lru_b", 0), None);
-        assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
+        assert_eq!(
+            cache.get_session_reasoning("reas_lru_a", 0),
+            Some("reasoning a".to_string())
+        );
     }
 
     #[test]
@@ -1151,7 +1345,11 @@ mod tests {
 
         // 1. 写入 1..5 轮
         for turn in 1..=5 {
-            cache.cache_session_signature("sess_rewind", format!("{}_{}", "x".repeat(50), turn), turn);
+            cache.cache_session_signature(
+                "sess_rewind",
+                format!("{}_{}", "x".repeat(50), turn),
+                turn,
+            );
         }
         assert!(cache.get_session_signature_at("sess_rewind", 5).is_some());
 
@@ -1162,16 +1360,25 @@ mod tests {
         // 验证：第 4 轮和第 5 轮应当被彻底删除（未来历史被丢弃）
         assert_eq!(cache.get_session_signature_at("sess_rewind", 4), None);
         assert_eq!(cache.get_session_signature_at("sess_rewind", 5), None);
-        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_new.clone()));
+        assert_eq!(
+            cache.get_session_signature_at("sess_rewind", 3),
+            Some(sig3_new.clone())
+        );
 
         // 3. 同轮更短签名替换测试：尝试用更短签名覆盖第 3 轮，应当被拒绝，保留较长签名
         let sig3_shorter = format!("{}_short", "z".repeat(50));
         cache.cache_session_signature("sess_rewind", sig3_shorter, 3);
-        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_new.clone()));
+        assert_eq!(
+            cache.get_session_signature_at("sess_rewind", 3),
+            Some(sig3_new.clone())
+        );
 
         // 4. 同轮更长签名替换测试：用更长签名覆盖第 3 轮，应当成功替换
         let sig3_longer = format!("{}_much_longer_version", "w".repeat(80));
         cache.cache_session_signature("sess_rewind", sig3_longer.clone(), 3);
-        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_longer));
+        assert_eq!(
+            cache.get_session_signature_at("sess_rewind", 3),
+            Some(sig3_longer)
+        );
     }
 }
