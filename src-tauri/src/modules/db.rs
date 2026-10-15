@@ -3,14 +3,6 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 fn get_antigravity_path(target_ide: Option<&str>) -> Option<PathBuf> {
-    if let Ok(config) = crate::modules::config::load_app_config() {
-        if let Some(path_str) = config.antigravity_executable {
-            let path = PathBuf::from(path_str);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-    }
     crate::modules::process::get_antigravity_executable_path(target_ide)
 }
 
@@ -42,11 +34,10 @@ pub fn get_all_candidate_db_paths(target_ide: Option<&str>) -> Vec<PathBuf> {
     }
 
     let folder_names: &[&str] = if target_ide == Some("ide") {
-        &["Antigravity IDE", "Antigravity"]
-    } else if target_ide == Some("code") || target_ide == Some("cursor") {
-        &["Antigravity", "Antigravity IDE"]
+        &["Antigravity IDE", "antigravity-ide", "antigravity_ide"]
     } else {
-        &["Antigravity IDE", "Antigravity"]
+        // target_ide = None 或 classic / code / cursor: 严格使用 Antigravity，严禁回退至 Antigravity IDE
+        &["Antigravity"]
     };
 
     #[cfg(target_os = "macos")]
@@ -108,7 +99,7 @@ pub fn inject_token(
     project_id: Option<&str>,
     id_token: Option<&str>,
     oauth_client_key: Option<&str>,
-    target_ide: Option<&str>,
+    _target_ide: Option<&str>,
 ) -> Result<String, String> {
     crate::modules::logger::log_info("Starting Token injection...");
 
@@ -153,6 +144,12 @@ fn inject_new_format(
     id_token: Option<&str>,
 ) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
+
+    // 忙等待：热切号场景下 Antigravity 仍在运行，数据库中可能存在并发写者；
+    // 显式设置 busy_timeout，让 SQLite 在瞬时锁竞争时等待重试，而不是立刻抛 SQLITE_BUSY
+    // （rusqlite 默认 busy_timeout = 0，写入会被瞬时锁直接拒绝）。
+    conn.busy_timeout(std::time::Duration::from_millis(2000))
+        .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
 
     // Create OAuthTokenInfo (binary)
     let oauth_info = protobuf::create_oauth_info(
@@ -264,6 +261,10 @@ pub fn write_service_machine_id(
 ) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
+    // 同 `inject_new_format`：热切号时应用仍在运行，忙等待避免瞬时锁竞争导致写入失败
+    conn.busy_timeout(std::time::Duration::from_millis(2000))
+        .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
+
     conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
         ["telemetry.serviceMachineId", service_machine_id],
@@ -276,4 +277,47 @@ pub fn write_service_machine_id(
     ));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ide_candidate_db_paths_includes_all_naming_variants() {
+        let ide_candidates = get_all_candidate_db_paths(Some("ide"));
+        let path_strings: Vec<String> = ide_candidates
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // 验证候选路径包含三种标准命名变体：空格、中划线与下划线
+        let has_space_variant = path_strings.iter().any(|s| s.contains("Antigravity IDE"));
+        let has_kebab_variant = path_strings.iter().any(|s| s.contains("antigravity-ide"));
+        let has_snake_variant = path_strings.iter().any(|s| s.contains("antigravity_ide"));
+
+        assert!(
+            has_space_variant,
+            "IDE candidates must include 'Antigravity IDE'"
+        );
+        assert!(
+            has_kebab_variant,
+            "IDE candidates must include kebab-case 'antigravity-ide'"
+        );
+        assert!(
+            has_snake_variant,
+            "IDE candidates must include snake-case 'antigravity_ide'"
+        );
+
+        // 验证严格隔离：针对 IDE 目标绝不包含纯经典版 'Antigravity/User/globalStorage' 路径
+        for p in &path_strings {
+            let is_classic = p.ends_with("Antigravity/User/globalStorage/state.vscdb")
+                || p.ends_with("Antigravity\\User\\globalStorage\\state.vscdb");
+            assert!(
+                !is_classic,
+                "IDE candidate paths must not contain classic Antigravity path: {}",
+                p
+            );
+        }
+    }
 }

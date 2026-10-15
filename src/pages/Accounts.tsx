@@ -27,7 +27,7 @@ import { showToast } from "../components/common/ToastContainer";
 import { exportAccounts } from "../services/accountService";
 import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
-import { Account } from "../types/account";
+import { Account, getAccountTier } from "../types/account";
 import { cn } from "../utils/cn";
 import { isTauri } from "../utils/env";
 import { request as invoke } from "../utils/request";
@@ -44,6 +44,7 @@ function Accounts() {
     accounts,
     currentAccount,
     fetchAccounts,
+    fetchCurrentAccount,
     addAccount,
     deleteAccount,
     deleteAccounts,
@@ -55,6 +56,7 @@ function Accounts() {
     warmUpAccounts,
     warmUpAccount,
     updateAccountLabel,
+    updateAccountPriority,
   } = useAccountStore();
   const { config, showAllQuotas, toggleShowAllQuotas } = useConfigStore();
 
@@ -239,7 +241,8 @@ function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
-  }, []);
+    fetchCurrentAccount();
+  }, [fetchAccounts, fetchCurrentAccount]);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
   useEffect(() => {
@@ -257,39 +260,16 @@ function Accounts() {
   const filterCounts = useMemo(() => {
     return {
       all: searchedAccounts.length,
-      pro: searchedAccounts.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("pro"),
-      ).length,
-      ultra: searchedAccounts.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("ultra"),
-      ).length,
-      free: searchedAccounts.filter((a) => {
-        const tier = a.quota?.subscription_tier?.toLowerCase();
-        return tier && !tier.includes("pro") && !tier.includes("ultra");
-      }).length,
+      pro: searchedAccounts.filter((a) => getAccountTier(a) === "pro").length,
+      ultra: searchedAccounts.filter((a) => getAccountTier(a) === "ultra").length,
+      free: searchedAccounts.filter((a) => getAccountTier(a) === "free").length,
     };
   }, [searchedAccounts]);
 
   // 过滤和搜索最终结果
   const filteredAccounts = useMemo(() => {
-    let result = searchedAccounts;
-
-    if (filter === "pro") {
-      result = result.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("pro"),
-      );
-    } else if (filter === "ultra") {
-      result = result.filter((a) =>
-        a.quota?.subscription_tier?.toLowerCase().includes("ultra"),
-      );
-    } else if (filter === "free") {
-      result = result.filter((a) => {
-        const tier = a.quota?.subscription_tier?.toLowerCase();
-        return tier && !tier.includes("pro") && !tier.includes("ultra");
-      });
-    }
-
-    return result;
+    if (filter === "all") return searchedAccounts;
+    return searchedAccounts.filter((a) => getAccountTier(a) === filter);
   }, [searchedAccounts, filter]);
 
   // Pagination Logic
@@ -1173,8 +1153,9 @@ function Accounts() {
       )}
 
       <AccountDetailsDialog
-        account={detailsAccount}
+        account={accounts.find(a => a.id === detailsAccount?.id) || null}
         onClose={() => setDetailsAccount(null)}
+        onUpdatePriority={updateAccountPriority}
       />
       <DeviceFingerprintDialog
         account={deviceAccount}
@@ -1266,12 +1247,6 @@ function Accounts() {
         isDestructive={false}
         onConfirm={handleWarmupAll}
         onCancel={() => setIsWarmupConfirmOpen(false)}
-      />
-
-      {/* 账号详情弹窗 */}
-      <AccountDetailsDialog
-        account={detailsAccount}
-        onClose={() => setDetailsAccount(null)}
       />
 
       {/* 账号错误详情弹窗 */}

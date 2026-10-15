@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 // Node.js proxy uses 2 hours TTL
 const SIGNATURE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
-const MIN_SIGNATURE_LENGTH: usize = 50;
+const MIN_SIGNATURE_LENGTH: usize = 32;
 
 // Different cache limits for different layers
 const TOOL_CACHE_LIMIT: usize = 500; // Layer 1: Tool-specific signatures
@@ -78,7 +78,7 @@ where
 /// 3. Session-based signature tracking (preventing cross-session pollution)
 pub struct SignatureCache {
     /// Layer 1: Tool Use ID -> Thinking Signature
-    /// Key: tool_use_id (e.g., "toolu_01...")
+    /// Key: session store key + separator + normalized tool_use_id
     /// Value: The thought signature that generated this tool call
     tool_signatures: Mutex<HashMap<String, CacheEntry<String>>>,
 
@@ -116,17 +116,40 @@ impl SignatureCache {
     }
 
     /// Store a tool call signature
-    pub fn cache_tool_signature(&self, tool_use_id: &str, signature: String) {
+    fn scoped_tool_key(store_key: &str, tool_id: &str) -> Option<String> {
+        let store_key = store_key.trim();
+        let tool_id = tool_id.trim();
+        if store_key.is_empty() || tool_id.is_empty() {
+            return None;
+        }
+        Some(format!("{store_key}\u{1f}{tool_id}"))
+    }
+
+    pub fn cache_tool_signature(&self, store_key: &str, tool_use_id: &str, signature: String) {
+        // 自愈防裂化：若签名被误传为原始 Protobuf 二进制 (首字节 0x12)，自动纠正编码为标准 Base64
+        let signature = if signature.as_bytes().first() == Some(&0x12) {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(signature.as_bytes())
+        } else {
+            signature
+        };
+
         if signature.len() < MIN_SIGNATURE_LENGTH {
             return;
         }
 
+        let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_use_id.trim());
+        let Some(id_str) = Self::scoped_tool_key(store_key, norm_id.as_ref()) else {
+            return;
+        };
+
+        // 1. 持久化到 SQLite L2 数据库 (支持代理重启后秒级恢复)
+        let _ = crate::modules::proxy_db::save_tool_signature(&id_str, &signature);
+
+        // 2. 写入内存 L1 缓存
         if let Ok(mut cache) = self.tool_signatures.lock() {
-            tracing::debug!(
-                "[SignatureCache] Caching tool signature for id: {}",
-                tool_use_id
-            );
-            cache.insert(tool_use_id.to_string(), CacheEntry::new(signature));
+            tracing::debug!("[SignatureCache] Caching tool signature for id: {}", id_str);
+            cache.insert(id_str, CacheEntry::new(signature));
 
             // Clean up expired entries and enforce capacity limit via LRU eviction
             if cache.len() > TOOL_CACHE_LIMIT {
@@ -145,20 +168,53 @@ impl SignatureCache {
         }
     }
 
-    /// Retrieve a signature for a tool_use_id
-    pub fn get_tool_signature(&self, tool_use_id: &str) -> Option<String> {
-        if let Ok(mut cache) = self.tool_signatures.lock() {
-            if let Some(entry) = cache.get_mut(tool_use_id) {
-                if !entry.is_expired() {
-                    entry.touch();
-                    tracing::debug!(
-                        "[SignatureCache] Hit tool signature for id: {}",
-                        tool_use_id
-                    );
-                    return Some(entry.data.clone());
-                }
+    /// Retrieve a signature for a tool_use_id inside one session store.
+    pub fn get_tool_signature(&self, store_key: &str, tool_use_id: &str) -> Option<String> {
+        let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_use_id.trim());
+        let mut candidate_ids = Vec::new();
+        if let Some(scoped) = Self::scoped_tool_key(store_key, norm_id.as_ref()) {
+            candidate_ids.push(scoped);
+        }
+        if norm_id.as_ref() != tool_use_id {
+            if let Some(scoped) = Self::scoped_tool_key(store_key, tool_use_id) {
+                candidate_ids.push(scoped);
             }
         }
+        if candidate_ids.is_empty() {
+            return None;
+        }
+
+        for candidate in &candidate_ids {
+            // 1. 先查内存 L1 缓存
+            if let Ok(mut cache) = self.tool_signatures.lock() {
+                if let Some(entry) = cache.get_mut(candidate) {
+                    if !entry.is_expired() {
+                        entry.touch();
+                        tracing::debug!(
+                            "[SignatureCache] Hit tool signature for id: {}",
+                            candidate
+                        );
+                        return Some(entry.data.clone());
+                    }
+                }
+            }
+
+            // 2. 内存未命中（如代理重启过），从 SQLite L2 数据库恢复
+            if let Ok(Some(sig)) = crate::modules::proxy_db::load_tool_signature(candidate) {
+                let sig: String = sig;
+                if let Ok(mut cache) = self.tool_signatures.lock() {
+                    cache.insert(candidate.clone(), CacheEntry::new(sig.clone()));
+                    cache.retain(|_, entry| !entry.is_expired());
+                    evict_oldest_if_needed(&mut cache, TOOL_CACHE_LIMIT, |v| v.last_accessed);
+                }
+                tracing::info!(
+                    "[SignatureCache] Restored tool signature from SQLite for id: {}",
+                    candidate
+                );
+                return Some(sig);
+            }
+        }
+
         None
     }
 
@@ -174,7 +230,12 @@ impl SignatureCache {
                 signature.len(),
                 family
             );
-            cache.insert(signature, CacheEntry::new(family));
+            let norm = crate::proxy::thinking_store::normalize_signature_for_comparison(&signature)
+                .into_owned();
+            cache.insert(signature.clone(), CacheEntry::new(family.clone()));
+            if norm != signature {
+                cache.insert(norm, CacheEntry::new(family));
+            }
 
             if cache.len() > FAMILY_CACHE_LIMIT {
                 let before = cache.len();
@@ -209,6 +270,15 @@ impl SignatureCache {
                     tracing::debug!("[SignatureCache] Signature family entry expired");
                 }
             }
+            let alt = crate::proxy::thinking_store::normalize_signature_for_comparison(signature);
+            if alt.as_ref() != signature {
+                if let Some(entry) = cache.get_mut(alt.as_ref()) {
+                    if !entry.is_expired() {
+                        entry.touch();
+                        return Some(entry.data.clone());
+                    }
+                }
+            }
         }
         None
     }
@@ -228,6 +298,14 @@ impl SignatureCache {
         signature: String,
         message_count: usize,
     ) {
+        // 自愈防裂化：若签名被误传为原始 Protobuf 二进制 (首字节 0x12)，自动纠正编码为标准 Base64
+        let signature = if signature.as_bytes().first() == Some(&0x12) {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(signature.as_bytes())
+        } else {
+            signature
+        };
+
         if signature.len() < MIN_SIGNATURE_LENGTH {
             return;
         }
@@ -305,7 +383,8 @@ impl SignatureCache {
                 // 双预算淘汰（spec G4）：轮次上限 + 字节上限，优先淘汰最早 message_count
                 loop {
                     let turn_ok = entry.data.len() <= SESSION_SIGNATURE_HISTORY_LIMIT;
-                    let bytes_total: usize = entry.data.values().map(|e| e.signature.capacity()).sum();
+                    let bytes_total: usize =
+                        entry.data.values().map(|e| e.signature.capacity()).sum();
                     let bytes_ok = bytes_total <= SESSION_SIGNATURE_HISTORY_BYTES;
                     if turn_ok && bytes_ok {
                         break;
@@ -363,6 +442,18 @@ impl SignatureCache {
             }
         }
         None
+    }
+
+    /// Check if the session cache already holds a signature for a turn after `message_count`.
+    pub fn has_session_signature_after(&self, session_id: &str, message_count: usize) -> bool {
+        if let Ok(cache) = self.session_signatures.lock() {
+            if let Some(entry) = cache.get(session_id) {
+                if !entry.is_expired() {
+                    return entry.data.keys().any(|&mc| mc > message_count);
+                }
+            }
+        }
+        false
     }
 
     /// Retrieve the thinking signature for a session at a specific message count.
@@ -625,19 +716,22 @@ mod tests {
 
     #[test]
     fn test_tool_signature_cache() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
         let cache = SignatureCache::new();
         let sig = "x".repeat(60); // Valid length
 
-        cache.cache_tool_signature("tool_1", sig.clone());
-        assert_eq!(cache.get_tool_signature("tool_1"), Some(sig));
-        assert_eq!(cache.get_tool_signature("tool_2"), None);
+        cache.cache_tool_signature("scope", "tool_1", sig.clone());
+        assert_eq!(cache.get_tool_signature("scope", "tool_1"), Some(sig));
+        assert_eq!(cache.get_tool_signature("scope", "tool_2"), None);
+        assert_eq!(cache.get_tool_signature("other", "tool_1"), None);
     }
 
     #[test]
     fn test_min_length() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
         let cache = SignatureCache::new();
-        cache.cache_tool_signature("tool_short", "short".to_string());
-        assert_eq!(cache.get_tool_signature("tool_short"), None);
+        cache.cache_tool_signature("scope", "tool_short", "short".to_string());
+        assert_eq!(cache.get_tool_signature("scope", "tool_short"), None);
     }
 
     #[test]
@@ -654,7 +748,7 @@ mod tests {
         let cache = SignatureCache::new();
         let sig1 = "a".repeat(60);
         let sig2 = "b".repeat(80); // Longer, should replace
-        let sig3 = "c".repeat(40); // Too short, should be ignored
+        let sig3 = "c".repeat(MIN_SIGNATURE_LENGTH - 1); // Too short, should be ignored
 
         // Initially empty
         assert!(cache.get_session_signature("sid-test123").is_none());
@@ -697,35 +791,37 @@ mod tests {
 
     #[test]
     fn test_clear_all_caches() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
         let cache = SignatureCache::new();
         let sig = "x".repeat(60);
 
-        cache.cache_tool_signature("tool_1", sig.clone());
+        cache.cache_tool_signature("scope", "tool_1", sig.clone());
         cache.cache_thinking_family(sig.clone(), "model".to_string());
         cache.cache_session_signature("sid-1", sig.clone(), 1);
 
-        assert!(cache.get_tool_signature("tool_1").is_some());
+        assert!(cache.get_tool_signature("scope", "tool_1").is_some());
         assert!(cache.get_signature_family(&sig).is_some());
         assert!(cache.get_session_signature("sid-1").is_some());
 
         cache.clear();
 
-        assert!(cache.get_tool_signature("tool_1").is_none());
+        assert_eq!(cache.tool_cache_len(), 0);
         assert!(cache.get_signature_family(&sig).is_none());
         assert!(cache.get_session_signature("sid-1").is_none());
     }
 
     #[test]
     fn test_tool_cache_unexpired_lru_eviction() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
         let cache = SignatureCache::new();
         let sig = "x".repeat(60);
 
         // Insert first item and sleep briefly to guarantee strictly older timestamp
-        cache.cache_tool_signature("tool_oldest", sig.clone());
+        cache.cache_tool_signature("scope", "tool_oldest", sig.clone());
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         for i in 0..TOOL_CACHE_LIMIT {
-            cache.cache_tool_signature(&format!("tool_{}", i), sig.clone());
+            cache.cache_tool_signature("scope", &format!("tool_{}", i), sig.clone());
         }
 
         // Total inserted is TOOL_CACHE_LIMIT + 1, all unexpired
@@ -733,11 +829,15 @@ mod tests {
         assert_eq!(cache.tool_cache_len(), TOOL_CACHE_LIMIT);
 
         // Oldest item must have been evicted
-        assert_eq!(cache.get_tool_signature("tool_oldest"), None);
+        assert!(!cache
+            .tool_signatures
+            .lock()
+            .unwrap()
+            .contains_key("scope\u{1f}tool_oldest"));
 
         // Most recently inserted item must still exist
         assert_eq!(
-            cache.get_tool_signature(&format!("tool_{}", TOOL_CACHE_LIMIT - 1)),
+            cache.get_tool_signature("scope", &format!("tool_{}", TOOL_CACHE_LIMIT - 1)),
             Some(sig)
         );
     }
@@ -814,28 +914,36 @@ mod tests {
 
     #[test]
     fn test_tool_signature_true_lru_access_promotes_entry() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
         let cache = SignatureCache::new();
         let sig = "x".repeat(50);
 
         // 插入 tool_a，随后插入 tool_b
-        cache.cache_tool_signature("tool_a", sig.clone());
+        cache.cache_tool_signature("scope", "tool_a", sig.clone());
         std::thread::sleep(std::time::Duration::from_millis(10));
-        cache.cache_tool_signature("tool_b", sig.clone());
+        cache.cache_tool_signature("scope", "tool_b", sig.clone());
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 读取命中 tool_a，刷新其 last_accessed
-        assert_eq!(cache.get_tool_signature("tool_a"), Some(sig.clone()));
+        assert_eq!(
+            cache.get_tool_signature("scope", "tool_a"),
+            Some(sig.clone())
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 插入填满并触发淘汰（插入 TOOL_CACHE_LIMIT - 1 个新项，总数为 TOOL_CACHE_LIMIT + 1，超限 1 项）
         for i in 0..(TOOL_CACHE_LIMIT - 1) {
-            cache.cache_tool_signature(&format!("tool_fill_{}", i), sig.clone());
+            cache.cache_tool_signature("scope", &format!("tool_fill_{}", i), sig.clone());
         }
 
         assert_eq!(cache.tool_cache_len(), TOOL_CACHE_LIMIT);
         // tool_a 后来被读取过，比未被读取的 tool_b 更晚访问，因此 tool_b 必然比 tool_a 先淘汰
-        assert_eq!(cache.get_tool_signature("tool_b"), None);
-        assert_eq!(cache.get_tool_signature("tool_a"), Some(sig));
+        assert!(!cache
+            .tool_signatures
+            .lock()
+            .unwrap()
+            .contains_key("scope\u{1f}tool_b"));
+        assert_eq!(cache.get_tool_signature("scope", "tool_a"), Some(sig));
     }
 
     #[test]
@@ -860,7 +968,9 @@ mod tests {
         // 最旧的第 1 轮应该已被移除
         assert!(!session_entry.data.contains_key(&1));
         // 最新的最后一轮应该存在
-        assert!(session_entry.data.contains_key(&(SESSION_SIGNATURE_HISTORY_LIMIT + 10)));
+        assert!(session_entry
+            .data
+            .contains_key(&(SESSION_SIGNATURE_HISTORY_LIMIT + 10)));
     }
 
     #[test]
@@ -886,6 +996,7 @@ mod tests {
         // 2. 注入时间：设为 3 小时前（超过 2 小时 TTL）
         let past = SystemTime::now() - Duration::from_secs(3 * 3600);
         cache.inject_session_signature_created_at("sess_exp", past);
+        assert!(!cache.has_session_signature_after("sess_exp", 0));
 
         // 3. 再次写入第 2 轮新签名
         cache.cache_session_signature("sess_exp", sig2.clone(), 2);
@@ -936,13 +1047,19 @@ mod tests {
     fn test_session_signature_turn_miss_does_not_refresh_touch() {
         let cache = SignatureCache::new();
         cache.cache_session_signature("sess_miss", "x".repeat(60), 1);
-        let t0 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        let t0 = cache
+            .get_session_signature_last_accessed("sess_miss")
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(cache.get_session_signature_at("sess_miss", 999), None);
-        let t1 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        let t1 = cache
+            .get_session_signature_last_accessed("sess_miss")
+            .unwrap();
         assert_eq!(t0, t1, "Turn miss must NOT refresh last_accessed");
         assert!(cache.get_session_signature_at("sess_miss", 1).is_some());
-        let t2 = cache.get_session_signature_last_accessed("sess_miss").unwrap();
+        let t2 = cache
+            .get_session_signature_last_accessed("sess_miss")
+            .unwrap();
         assert!(t2 > t1, "Turn hit MUST refresh last_accessed");
     }
 
@@ -985,17 +1102,34 @@ mod tests {
     fn test_oversized_reasoning_does_not_modify_existing_session() {
         let cache = SignatureCache::new();
         cache.append_reasoning("sess_exist", "valid reasoning 0".to_string(), 0);
-        let orig_created = cache.get_session_reasoning_created_at("sess_exist").unwrap();
-        let orig_len = cache.get_session_reasoning_history_len("sess_exist").unwrap();
+        let orig_created = cache
+            .get_session_reasoning_created_at("sess_exist")
+            .unwrap();
+        let orig_len = cache
+            .get_session_reasoning_history_len("sess_exist")
+            .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         let huge = "r".repeat(MAX_REASONING_BYTES + 100);
         cache.append_reasoning("sess_exist", huge, 1);
 
-        assert_eq!(cache.get_session_reasoning("sess_exist", 0), Some("valid reasoning 0".to_string()));
+        assert_eq!(
+            cache.get_session_reasoning("sess_exist", 0),
+            Some("valid reasoning 0".to_string())
+        );
         assert_eq!(cache.get_session_reasoning("sess_exist", 1), None);
-        assert_eq!(cache.get_session_reasoning_history_len("sess_exist").unwrap(), orig_len);
-        assert_eq!(cache.get_session_reasoning_created_at("sess_exist").unwrap(), orig_created);
+        assert_eq!(
+            cache
+                .get_session_reasoning_history_len("sess_exist")
+                .unwrap(),
+            orig_len
+        );
+        assert_eq!(
+            cache
+                .get_session_reasoning_created_at("sess_exist")
+                .unwrap(),
+            orig_created
+        );
     }
 
     #[test]
@@ -1007,13 +1141,20 @@ mod tests {
 
         // 有效写入刷新 TTL
         cache.append_reasoning("sess_r_ttl", "reasoning 1 longer".to_string(), 1);
-        let new_created = cache.get_session_reasoning_created_at("sess_r_ttl").unwrap();
-        assert!(new_created.elapsed().unwrap().as_secs() < 5, "Reasoning valid write MUST refresh TTL");
+        let new_created = cache
+            .get_session_reasoning_created_at("sess_r_ttl")
+            .unwrap();
+        assert!(
+            new_created.elapsed().unwrap().as_secs() < 5,
+            "Reasoning valid write MUST refresh TTL"
+        );
 
         // 读取命中不延长 TTL
         cache.inject_session_reasoning_created_at("sess_r_ttl", old_time);
         assert!(cache.get_session_reasoning("sess_r_ttl", 1).is_some());
-        let read_created = cache.get_session_reasoning_created_at("sess_r_ttl").unwrap();
+        let read_created = cache
+            .get_session_reasoning_created_at("sess_r_ttl")
+            .unwrap();
         assert_eq!(read_created, old_time, "Read must NOT extend TTL");
     }
 
@@ -1029,13 +1170,19 @@ mod tests {
         let shorter = "y".repeat(60);
         cache.cache_session_signature("sess_rej", shorter, 1);
         let after_time = cache.get_session_signature_created_at("sess_rej").unwrap();
-        assert_eq!(after_time, old_time, "Rejected same-turn shorter write must NOT refresh TTL");
+        assert_eq!(
+            after_time, old_time,
+            "Rejected same-turn shorter write must NOT refresh TTL"
+        );
 
         // 单条超 1 MiB 签名被拒绝，不得刷新 TTL
         let oversized = "z".repeat(SESSION_SIGNATURE_HISTORY_BYTES + 10);
         cache.cache_session_signature("sess_rej", oversized, 2);
         let after_oversized = cache.get_session_signature_created_at("sess_rej").unwrap();
-        assert_eq!(after_oversized, old_time, "Rejected oversized signature must NOT refresh TTL");
+        assert_eq!(
+            after_oversized, old_time,
+            "Rejected oversized signature must NOT refresh TTL"
+        );
     }
 
     #[test]
@@ -1065,7 +1212,14 @@ mod tests {
         }
 
         // 验证硬上限 256 轮
-        let count = cache.session_signatures.lock().unwrap().get("sess_10k").unwrap().data.len();
+        let count = cache
+            .session_signatures
+            .lock()
+            .unwrap()
+            .get("sess_10k")
+            .unwrap()
+            .data
+            .len();
         assert_eq!(count, SESSION_SIGNATURE_HISTORY_LIMIT);
         assert!(count <= 256);
 
@@ -1086,18 +1240,27 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 访问 sig_a 提升其为活跃项
-        assert_eq!(cache.get_signature_family(&sig_a), Some("family_a".to_string()));
+        assert_eq!(
+            cache.get_signature_family(&sig_a),
+            Some("family_a".to_string())
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 填满超额 1 项
         for i in 0..(FAMILY_CACHE_LIMIT - 1) {
-            cache.set_thinking_family(format!("sig_fill_{}_{}", i, "x".repeat(60)), format!("fam_{}", i));
+            cache.set_thinking_family(
+                format!("sig_fill_{}_{}", i, "x".repeat(60)),
+                format!("fam_{}", i),
+            );
         }
 
         assert_eq!(cache.family_cache_len(), FAMILY_CACHE_LIMIT);
         // sig_b 未被访问，早于 sig_a 淘汰
         assert_eq!(cache.get_signature_family(&sig_b), None);
-        assert_eq!(cache.get_signature_family(&sig_a), Some("family_a".to_string()));
+        assert_eq!(
+            cache.get_signature_family(&sig_a),
+            Some("family_a".to_string())
+        );
     }
 
     #[test]
@@ -1132,17 +1295,27 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 访问 reas_lru_a 提升活跃度
-        assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
+        assert_eq!(
+            cache.get_session_reasoning("reas_lru_a", 0),
+            Some("reasoning a".to_string())
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // 填满超额 1 项
         for i in 0..(SESSION_CACHE_LIMIT - 1) {
-            cache.append_reasoning(&format!("reas_fill_{}", i), format!("reasoning fill {}", i), 0);
+            cache.append_reasoning(
+                &format!("reas_fill_{}", i),
+                format!("reasoning fill {}", i),
+                0,
+            );
         }
 
         assert_eq!(cache.reasoning_cache_len(), SESSION_CACHE_LIMIT);
         assert_eq!(cache.get_session_reasoning("reas_lru_b", 0), None);
-        assert_eq!(cache.get_session_reasoning("reas_lru_a", 0), Some("reasoning a".to_string()));
+        assert_eq!(
+            cache.get_session_reasoning("reas_lru_a", 0),
+            Some("reasoning a".to_string())
+        );
     }
 
     #[test]
@@ -1151,9 +1324,16 @@ mod tests {
 
         // 1. 写入 1..5 轮
         for turn in 1..=5 {
-            cache.cache_session_signature("sess_rewind", format!("{}_{}", "x".repeat(50), turn), turn);
+            cache.cache_session_signature(
+                "sess_rewind",
+                format!("{}_{}", "x".repeat(50), turn),
+                turn,
+            );
         }
         assert!(cache.get_session_signature_at("sess_rewind", 5).is_some());
+        assert!(cache.has_session_signature_after("sess_rewind", 3));
+        assert!(!cache.has_session_signature_after("sess_rewind", 5));
+        assert!(!cache.has_session_signature_after("other-session", 0));
 
         // 2. Rewind 到第 3 轮（重新生成第 3 轮）
         let sig3_new = format!("{}_rewind_v2", "y".repeat(60));
@@ -1162,16 +1342,168 @@ mod tests {
         // 验证：第 4 轮和第 5 轮应当被彻底删除（未来历史被丢弃）
         assert_eq!(cache.get_session_signature_at("sess_rewind", 4), None);
         assert_eq!(cache.get_session_signature_at("sess_rewind", 5), None);
-        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_new.clone()));
+        assert!(!cache.has_session_signature_after("sess_rewind", 3));
+        assert_eq!(
+            cache.get_session_signature_at("sess_rewind", 3),
+            Some(sig3_new.clone())
+        );
 
         // 3. 同轮更短签名替换测试：尝试用更短签名覆盖第 3 轮，应当被拒绝，保留较长签名
         let sig3_shorter = format!("{}_short", "z".repeat(50));
         cache.cache_session_signature("sess_rewind", sig3_shorter, 3);
-        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_new.clone()));
+        assert_eq!(
+            cache.get_session_signature_at("sess_rewind", 3),
+            Some(sig3_new.clone())
+        );
 
         // 4. 同轮更长签名替换测试：用更长签名覆盖第 3 轮，应当成功替换
         let sig3_longer = format!("{}_much_longer_version", "w".repeat(80));
         cache.cache_session_signature("sess_rewind", sig3_longer.clone(), 3);
-        assert_eq!(cache.get_session_signature_at("sess_rewind", 3), Some(sig3_longer));
+        assert_eq!(
+            cache.get_session_signature_at("sess_rewind", 3),
+            Some(sig3_longer)
+        );
+    }
+
+    #[test]
+    fn test_tool_signature_sqlite_recovery() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tool_id = "call_sig_sqlite_recovery_unique";
+        let sig = "s".repeat(60);
+
+        // 1. Direct save to SQLite
+        let scoped = format!("scope\u{1f}{tool_id}");
+        crate::modules::proxy_db::init_db().unwrap();
+        crate::modules::proxy_db::save_tool_signature(&scoped, &sig).unwrap();
+
+        // 2. New in-memory cache (simulating proxy restart)
+        let cache = SignatureCache::new();
+
+        {
+            let mut l1 = cache.tool_signatures.lock().unwrap();
+            for i in 0..TOOL_CACHE_LIMIT {
+                l1.insert(format!("other\u{1f}tool_{i}"), CacheEntry::new(sig.clone()));
+            }
+        }
+
+        // 3. get_tool_signature should fall back to SQLite and populate bounded L1 cache
+        let recovered = cache.get_tool_signature("scope", tool_id);
+        assert_eq!(recovered, Some(sig.clone()));
+        assert_eq!(cache.tool_cache_len(), TOOL_CACHE_LIMIT);
+        assert_eq!(cache.get_tool_signature("other", tool_id), None);
+
+        // 4. Second lookup should hit L1
+        assert_eq!(cache.get_tool_signature("scope", tool_id), Some(sig));
+    }
+
+    #[test]
+    fn test_expired_scoped_l1_recovers_from_sqlite_with_bounded_lru() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        let cache = SignatureCache::new();
+        let signature = "s".repeat(60);
+        let tool_id = "call_123456";
+        let key = SignatureCache::scoped_tool_key("session-a", tool_id).unwrap();
+        cache.cache_tool_signature("session-a", tool_id, signature.clone());
+        let expired_at = SystemTime::now() - SIGNATURE_TTL - Duration::from_secs(1);
+        let oldest_access = SystemTime::now() - Duration::from_secs(60);
+        {
+            let mut l1 = cache.tool_signatures.lock().unwrap();
+            let expired = l1.get_mut(&key).unwrap();
+            expired.created_at = expired_at;
+            expired.data = "stale-l1".repeat(8);
+            assert!(expired.is_expired());
+            // Exercise capacity enforcement during recovery, not during insertion.
+            for i in 0..TOOL_CACHE_LIMIT {
+                let mut entry = CacheEntry::new(signature.clone());
+                if i == 0 {
+                    entry.last_accessed = oldest_access;
+                }
+                l1.insert(format!("session-a\u{1f}fill_{i}"), entry);
+            }
+        }
+        assert_eq!(cache.get_tool_signature("session-b", tool_id), None);
+        let recovery_started = SystemTime::now();
+        assert_eq!(
+            cache.get_tool_signature("session-a", "call123456"),
+            Some(signature.clone())
+        );
+        assert_eq!(cache.get_tool_signature("session-b", "call123456"), None);
+        {
+            let l1 = cache.tool_signatures.lock().unwrap();
+            assert_eq!(l1.len(), TOOL_CACHE_LIMIT);
+            assert!(!l1.contains_key("session-a\u{1f}fill_0"));
+            let recovered = l1.get(&key).unwrap();
+            assert!(!recovered.is_expired());
+            assert!(recovered.created_at >= recovery_started);
+            assert!(recovered.last_accessed >= recovery_started);
+            assert_eq!(recovered.data, signature);
+        }
+        cache
+            .tool_signatures
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .last_accessed = oldest_access;
+        assert_eq!(
+            cache.get_tool_signature("session-a", tool_id),
+            Some(signature)
+        );
+        let l1 = cache.tool_signatures.lock().unwrap();
+        assert_eq!(l1.len(), TOOL_CACHE_LIMIT);
+        assert!(l1.get(&key).unwrap().last_accessed >= recovery_started);
+    }
+
+    #[test]
+    fn test_tool_signature_normalization_match() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let cache = SignatureCache::new();
+        let sig = "s".repeat(60);
+
+        // Case A: Upstream generated call_573077, client requests with call573077
+        cache.cache_tool_signature("scope", "call_573077", sig.clone());
+        assert_eq!(
+            cache.get_tool_signature("scope", "call573077"),
+            Some(sig.clone())
+        );
+        assert_eq!(
+            cache.get_tool_signature("scope", "call_573077"),
+            Some(sig.clone())
+        );
+
+        // Case B: Client stored with call888888, lookup with call_888888
+        let sig2 = "t".repeat(60);
+        cache.cache_tool_signature("scope", "call888888", sig2.clone());
+        assert_eq!(
+            cache.get_tool_signature("scope", "call_888888"),
+            Some(sig2.clone())
+        );
+        assert_eq!(cache.get_tool_signature("scope", "call888888"), Some(sig2));
+    }
+
+    #[test]
+    fn test_scoped_tool_signature_blank_keys_and_expired_l1() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let cache = SignatureCache::new();
+        let sig = "s".repeat(60);
+        cache.cache_tool_signature(" ", "call_123", sig.clone());
+        cache.cache_tool_signature("scope", " ", sig.clone());
+        assert_eq!(cache.tool_cache_len(), 0);
+        assert_eq!(cache.get_tool_signature("", "call_123"), None);
+        assert_eq!(cache.get_tool_signature("scope", ""), None);
+
+        cache.cache_tool_signature(" scope ", " call123 ", sig.clone());
+        assert_eq!(cache.get_tool_signature("scope", "call_123"), Some(sig));
+        let key = SignatureCache::scoped_tool_key("scope", "call_123").unwrap();
+        cache
+            .tool_signatures
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .created_at = SystemTime::now() - SIGNATURE_TTL - Duration::from_secs(1);
+        // This fixture has no signature table, so expired L1 entries have no L2 recovery.
+        assert_eq!(cache.get_tool_signature("scope", "call123"), None);
     }
 }

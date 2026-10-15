@@ -2,7 +2,7 @@ use serde::Serialize;
 use serde_json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -12,7 +12,7 @@ use crate::models::{
 };
 use crate::modules;
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Global per-account lock to prevent concurrent write collisions on the same account JSON file
 static ACCOUNT_FILE_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -27,13 +27,15 @@ fn get_account_lock(account_id: &str) -> Arc<Mutex<()>> {
 }
 
 #[cfg(test)]
+pub(crate) static SHARED_TEST_ENV_LOCK: Lazy<std::sync::Mutex<()>> =
+    Lazy::new(|| std::sync::Mutex::new(()));
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Mutex as StdMutex;
 
-    // Global mutex to prevent concurrent test execution
-    static TEST_MUTEX: Lazy<StdMutex<()>> = Lazy::new(|| StdMutex::new(()));
+    static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     struct TestDataDir {
         path: PathBuf,
@@ -41,13 +43,15 @@ mod tests {
 
     impl TestDataDir {
         fn new() -> Self {
+            let seq = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let temp_path = std::env::temp_dir().join(format!(
-                "antigravity_test_{}_{}",
+                "antigravity_test_{}_{}_{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_millis()
+                    .as_nanos(),
+                seq
             ));
             fs::create_dir_all(&temp_path).expect("Failed to create temp dir");
 
@@ -97,8 +101,106 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_data_dir_path_strips_windows_prefix() {
+        assert_eq!(
+            format_data_dir_path(Path::new(r"\\?\F:\antigravity-tools-data")),
+            r"F:\antigravity-tools-data"
+        );
+        assert_eq!(
+            format_data_dir_path(Path::new(r"\\?\UNC\server\share\data")),
+            r"\\server\share\data"
+        );
+        assert_eq!(format_data_dir_path(Path::new("//?/C:/data")), "C:/data");
+        assert_eq!(format_data_dir_path(Path::new("/app/data")), "/app/data");
+        assert_eq!(
+            format_data_dir_path(Path::new(r"F:\antigravity-tools-data")),
+            r"F:\antigravity-tools-data"
+        );
+    }
+
+    #[test]
+    fn test_migrate_data_dir_rename_and_copy() {
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let previous_env = std::env::var("ABV_DATA_DIR").ok();
+        let previous_pointer_env = std::env::var("ABV_DATA_DIR_POINTER_FILE").ok();
+
+        // 记录真实家目录指针，结尾断言它自始至终没被改动。
+        // 背景：`migrate_data_dir` 会写数据目录指针。如果测试让它写到真实的
+        // `~/.antigravity_tools_location`，那么测试一旦被中断（Ctrl-C / 超时 /
+        // 进程被杀），恢复逻辑不会执行，用户的数据目录就会被永久指向 /tmp 下的
+        // 临时目录 —— 应用下次启动会读到空数据目录，表现为「账号全部消失」。
+        let real_pointer = dirs::home_dir()
+            .expect("home")
+            .join(".antigravity_tools_location");
+        let real_pointer_before = fs::read_to_string(&real_pointer).ok();
+
+        let src = TestDataDir::new();
+        fs::write(src.path().join("marker.txt"), "hello").unwrap();
+
+        let dest_parent = TestDataDir::new();
+        let dest = dest_parent.path().join("moved_data");
+        // 指针文件也放进临时目录（复用已存在的 dest_parent，避免多建一个
+        // 时间戳目录而可能与 src 撞名）
+        let pointer_path = dest_parent.path().join("location");
+
+        std::env::set_var("ABV_DATA_DIR", src.path());
+        std::env::set_var("ABV_DATA_DIR_POINTER_FILE", &pointer_path);
+
+        let restore = || {
+            match &previous_env {
+                Some(value) => std::env::set_var("ABV_DATA_DIR", value),
+                None => std::env::remove_var("ABV_DATA_DIR"),
+            }
+            match &previous_pointer_env {
+                Some(value) => std::env::set_var("ABV_DATA_DIR_POINTER_FILE", value),
+                None => std::env::remove_var("ABV_DATA_DIR_POINTER_FILE"),
+            }
+            if let Ok(mut guard) = data_dir_override_slot().write() {
+                *guard = None;
+            }
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let resolved = migrate_data_dir(dest.clone()).unwrap();
+            assert!(resolved.join("marker.txt").exists());
+            assert!(!src.path().join("marker.txt").exists());
+            assert_eq!(
+                fs::read_to_string(resolved.join("marker.txt")).unwrap(),
+                "hello"
+            );
+            let shown = format_data_dir_path(&resolved);
+            assert!(
+                !shown.contains(r"\\?\"),
+                "migrated path must not keep Windows verbatim prefix: {shown}"
+            );
+            // 指针必须写在被重定向后的临时位置
+            assert_eq!(
+                fs::read_to_string(&pointer_path).unwrap().trim(),
+                format_data_dir_path(&resolved)
+            );
+        }));
+
+        let real_pointer_after = fs::read_to_string(&real_pointer).ok();
+        restore();
+
+        assert_eq!(
+            real_pointer_before, real_pointer_after,
+            "测试污染了真实的 ~/.antigravity_tools_location！"
+        );
+
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
     fn test_load_account_index_with_bom_prefix() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // UTF-8 BOM followed by valid JSON
@@ -125,7 +227,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_nul_prefix() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // NUL byte prefix followed by valid JSON
@@ -152,7 +256,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_garbage_content() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Non-JSON garbage content - should trigger recovery
@@ -176,7 +282,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_empty_file() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Empty file
@@ -192,7 +300,9 @@ mod tests {
 
     #[test]
     fn test_load_account_index_with_whitespace_only() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Whitespace-only file
@@ -208,7 +318,9 @@ mod tests {
 
     #[test]
     fn test_missing_index_with_existing_accounts() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Create accounts directory with account files but NO accounts.json index
@@ -255,7 +367,9 @@ mod tests {
 
     #[test]
     fn test_save_account_index_roundtrip() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Build an AccountIndex with 2 accounts
@@ -332,7 +446,9 @@ mod tests {
 
     #[test]
     fn test_set_current_account_id_with_target() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
         std::env::set_var("ABV_DATA_DIR", dir.path());
 
@@ -377,7 +493,9 @@ mod tests {
 
     #[test]
     fn test_backup_created_on_parse_failure() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         // Create a valid account file
@@ -428,7 +546,9 @@ mod tests {
 
     #[test]
     fn test_load_account_with_trailing_characters() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
 
         create_account_file(dir.path(), "corrupt-tail-acc", "tail@example.com");
@@ -440,19 +560,25 @@ mod tests {
         fs::write(&account_path, &raw).unwrap();
 
         // Load account should successfully self-heal and return valid Account
-        let loaded = load_account_at_path(&account_path).expect("Should self-heal trailing characters");
+        let loaded =
+            load_account_at_path(&account_path).expect("Should self-heal trailing characters");
         assert_eq!(loaded.id, "corrupt-tail-acc");
         assert_eq!(loaded.email, "tail@example.com");
 
         // Verify the file was cleaned and re-written as valid JSON
         let healed_raw = fs::read_to_string(&account_path).unwrap();
         let regular_parse: Result<Account, _> = serde_json::from_str(&healed_raw);
-        assert!(regular_parse.is_ok(), "Healed file should be standard valid JSON");
+        assert!(
+            regular_parse.is_ok(),
+            "Healed file should be standard valid JSON"
+        );
     }
 
     #[test]
     fn task_quota_refresh_keeps_unexpired_live_limit() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _guard = SHARED_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TestDataDir::new();
         let account_id = "live-limit-account";
         create_account_file(dir.path(), account_id, "live-limit@example.com");
@@ -531,33 +657,336 @@ pub(crate) fn lock_account_file_updates() -> Result<std::sync::MutexGuard<'stati
 }
 
 // ... existing constants ...
+#[allow(dead_code)]
 const DATA_DIR: &str = ".antigravity_tools";
+#[allow(dead_code)]
+const LOCATION_POINTER_FILE: &str = ".antigravity_tools_location";
 const ACCOUNTS_INDEX: &str = "accounts.json";
 const ACCOUNTS_DIR: &str = "accounts";
+const DATA_DIR_POINTER_FILE: &str = "data_dir.txt";
+
+/// 获取数据目录自举指针文件路径（保存在系统标准配置目录下）
+pub fn get_data_dir_pointer_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("antigravity-tools").join(DATA_DIR_POINTER_FILE))
+}
+
+static DATA_DIR_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+
+fn data_dir_override_slot() -> &'static RwLock<Option<PathBuf>> {
+    DATA_DIR_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+/// 数据目录指针文件的路径。
+///
+/// 可用 `ABV_DATA_DIR_POINTER_FILE` 覆盖（测试 / Docker 用）。
+///
+/// 为什么必须支持覆盖：单元测试会调用 `migrate_data_dir`，它经由 `apply_data_dir`
+/// 写入这个指针。若指针固定指向真实的 `~/.antigravity_tools_location`，那么测试一旦
+/// 被中断（Ctrl-C、超时、崩溃、进程被杀），恢复逻辑就不会执行，指针会被永久留在
+/// 临时目录上 —— 应用下次启动就会读到一个空的数据目录，表现为「账号全部消失」。
+fn location_pointer_path() -> Result<PathBuf, String> {
+    if let Ok(custom) = std::env::var("ABV_DATA_DIR_POINTER_FILE") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return Ok(normalize_data_dir_path(trimmed));
+        }
+    }
+    #[cfg(test)]
+    {
+        return Err(
+            "location pointer reading disabled in tests without explicit ABV_DATA_DIR_POINTER_FILE"
+                .to_string(),
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
+        Ok(home.join(LOCATION_POINTER_FILE))
+    }
+}
+
+fn default_data_dir() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        return Err("default_data_dir disabled in tests to protect host".to_string());
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
+        Ok(home.join(DATA_DIR))
+    }
+}
+
+fn ensure_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        fs::create_dir_all(path).map_err(|e| format!("failed_to_create_data_dir: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Strip Windows `\\?\` / `\\?\UNC\` prefixes and quotes so paths stay portable
+/// across Windows, Linux, macOS and Docker (`ABV_DATA_DIR=/app/data`).
+fn strip_extended_path_prefix(input: &str) -> String {
+    let s = input
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '\u{feff}');
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    if let Some(rest) = s.strip_prefix("//?/UNC/") {
+        return format!("//{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    s.to_string()
+}
+
+fn expand_user_path(input: &str) -> Option<PathBuf> {
+    if input == "~" || input.starts_with("~/") || input.starts_with("~\\") {
+        let home = dirs::home_dir()?;
+        let rest = input
+            .trim_start_matches('~')
+            .trim_start_matches(['/', '\\']);
+        return Some(if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        });
+    }
+    None
+}
+
+/// Normalize a data-dir path for persistence, env vars and UI display.
+pub fn normalize_data_dir_path(path: impl AsRef<Path>) -> PathBuf {
+    let raw = path.as_ref().to_string_lossy();
+    let stripped = strip_extended_path_prefix(&raw);
+    if let Some(expanded) = expand_user_path(&stripped) {
+        return expanded;
+    }
+    PathBuf::from(stripped)
+}
+
+/// Human-readable path without Windows verbatim prefixes.
+pub fn format_data_dir_path(path: &Path) -> String {
+    normalize_data_dir_path(path).to_string_lossy().into_owned()
+}
+
+fn resolve_existing_path(path: &Path) -> PathBuf {
+    let normalized = normalize_data_dir_path(path);
+    match normalized.canonicalize() {
+        Ok(canon) => normalize_data_dir_path(canon),
+        Err(_) => normalized,
+    }
+}
+
+fn path_compare_key(path: &Path) -> String {
+    let mut s = resolve_existing_path(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    #[cfg(windows)]
+    {
+        s = s.to_ascii_lowercase();
+    }
+    s
+}
+
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    path_compare_key(a) == path_compare_key(b)
+}
+
+fn is_nested_data_dir(inner: &Path, outer: &Path) -> bool {
+    let inner_key = path_compare_key(inner);
+    let outer_key = path_compare_key(outer);
+    inner_key != outer_key && inner_key.starts_with(&(outer_key + "/"))
+}
+
+fn persist_clean_env(dir: &Path) {
+    std::env::set_var("ABV_DATA_DIR", format_data_dir_path(dir));
+}
+
+fn read_location_pointer() -> Option<PathBuf> {
+    let path = location_pointer_path().ok()?;
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned = normalize_data_dir_path(trimmed);
+    if format_data_dir_path(&cleaned) != trimmed {
+        let _ = write_location_pointer(&cleaned);
+    }
+    Some(cleaned)
+}
+
+fn write_location_pointer(dir: &Path) -> Result<(), String> {
+    let pointer = location_pointer_path()?;
+    fs::write(&pointer, format_data_dir_path(dir).as_bytes())
+        .map_err(|e| format!("写入数据目录指针失败: {}", e))
+}
+
+fn is_default_data_dir(dir: &Path) -> bool {
+    default_data_dir()
+        .map(|d| paths_equivalent(&d, dir) || d == dir)
+        .unwrap_or(false)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("创建目标数据目录失败: {}", e))?;
+    for entry in fs::read_dir(src).map_err(|e| format!("读取原数据目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("读取数据目录项失败: {}", e))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("读取数据目录项类型失败: {}", e))?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("创建目标子目录失败: {}", e))?;
+            }
+            fs::copy(&from, &to).map_err(|e| format!("复制文件失败 {}: {}", from.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn dir_is_empty(path: &Path) -> Result<bool, String> {
+    let mut entries = fs::read_dir(path).map_err(|e| format!("读取目标目录失败: {}", e))?;
+    Ok(entries.next().is_none())
+}
+
+fn apply_data_dir(dir: &Path) -> Result<(), String> {
+    let dir = normalize_data_dir_path(dir);
+    ensure_dir(&dir)?;
+    if is_default_data_dir(&dir) {
+        if let Ok(pointer) = location_pointer_path() {
+            let _ = fs::remove_file(pointer);
+        }
+    } else {
+        write_location_pointer(&dir)?;
+    }
+    if let Ok(mut guard) = data_dir_override_slot().write() {
+        *guard = Some(dir.clone());
+    }
+    persist_clean_env(&dir);
+    Ok(())
+}
 
 /// Get data directory path
 pub fn get_data_dir() -> Result<PathBuf, String> {
-    // [NEW] Support custom data directory via environment variable
+    // 1. Process env (tests, Docker, and in-process override after migrate)
     if let Ok(env_path) = std::env::var("ABV_DATA_DIR") {
         if !env_path.trim().is_empty() {
-            let data_dir = PathBuf::from(env_path);
-            if !data_dir.exists() {
-                fs::create_dir_all(&data_dir)
-                    .map_err(|e| format!("failed_to_create_custom_data_dir: {}", e))?;
+            let data_dir = normalize_data_dir_path(&env_path);
+            ensure_dir(&data_dir)?;
+            if format_data_dir_path(&data_dir) != env_path {
+                persist_clean_env(&data_dir);
             }
             return Ok(data_dir);
         }
     }
 
-    let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-    let data_dir = home.join(DATA_DIR);
-
-    // Ensure directory exists
-    if !data_dir.exists() {
-        fs::create_dir_all(&data_dir).map_err(|e| format!("failed_to_create_data_dir: {}", e))?;
+    // 2. Runtime override (pointer already loaded this session)
+    if let Ok(guard) = data_dir_override_slot().read() {
+        if let Some(ref path) = *guard {
+            let data_dir = normalize_data_dir_path(path);
+            ensure_dir(&data_dir)?;
+            return Ok(data_dir);
+        }
     }
 
-    Ok(data_dir)
+    // 3. Pointer file outside the data dir so deleting the old folder still finds the new path
+    if let Some(path) = read_location_pointer() {
+        ensure_dir(&path)?;
+        if let Ok(mut guard) = data_dir_override_slot().write() {
+            *guard = Some(path.clone());
+        }
+        return Ok(path);
+    }
+
+    // 4. Default ~/.antigravity_tools
+    #[cfg(test)]
+    {
+        // [DEFENSIVE] 在单元测试执行期间，严禁回落并写入真实宿主机的 ~/.antigravity_tools 目录！
+        // 若测试未显式设置 ABV_DATA_DIR，为整个测试进程分配唯一的临时沙盒目录，
+        // 保证跨多线程（如 thread::spawn）与多步操作（建表->读写）指向同一个沙盒，
+        // 且绝对不污染宿主机真实的 ~/.antigravity_tools 目录
+        static TEST_FALLBACK_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let fallback_test_dir = TEST_FALLBACK_DIR
+            .get_or_init(|| {
+                std::env::temp_dir().join(format!(
+                    "antigravity_unit_test_fallback_sandbox_{}",
+                    std::process::id()
+                ))
+            })
+            .clone();
+        ensure_dir(&fallback_test_dir)?;
+        Ok(fallback_test_dir)
+    }
+    #[cfg(not(test))]
+    {
+        let data_dir = default_data_dir()?;
+        ensure_dir(&data_dir)?;
+        Ok(data_dir)
+    }
+}
+
+/// Move the data directory to `new_dir`, persist the location, and switch all runtime lookups.
+pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
+    let new_dir = normalize_data_dir_path(new_dir);
+    let new_dir = if new_dir.as_os_str().is_empty() {
+        return Err("目标数据目录不能为空".to_string());
+    } else if new_dir.is_absolute() {
+        new_dir
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("无法解析相对路径: {}", e))?
+            .join(new_dir)
+    };
+
+    let old_dir = normalize_data_dir_path(get_data_dir()?);
+    if paths_equivalent(&old_dir, &new_dir) {
+        apply_data_dir(&old_dir)?;
+        return Ok(resolve_existing_path(&old_dir));
+    }
+
+    if is_nested_data_dir(&new_dir, &old_dir) {
+        return Err("不能把数据目录迁移到自身内部".to_string());
+    }
+
+    if new_dir.exists() {
+        if new_dir.is_file() {
+            return Err("目标路径已存在且不是目录".to_string());
+        }
+        if !dir_is_empty(&new_dir)? {
+            return Err("目标目录不是空文件夹，请选择空目录或新路径".to_string());
+        }
+        copy_dir_recursive(&old_dir, &new_dir)?;
+        let _ = fs::remove_dir_all(&old_dir);
+    } else if let Some(parent) = new_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目标父目录失败: {}", e))?;
+        match fs::rename(&old_dir, &new_dir) {
+            Ok(()) => {}
+            Err(_) => {
+                copy_dir_recursive(&old_dir, &new_dir)?;
+                let _ = fs::remove_dir_all(&old_dir);
+            }
+        }
+    } else {
+        return Err("目标路径无效".to_string());
+    }
+
+    let resolved = resolve_existing_path(&new_dir);
+    apply_data_dir(&resolved)?;
+    Ok(resolved)
 }
 
 /// Get accounts directory path
@@ -708,12 +1137,15 @@ fn load_account_at_path(account_path: &PathBuf) -> Result<Account, String> {
     let content = fs::read_to_string(account_path)
         .map_err(|e| format!("failed_to_read_account_data: {}", e))?;
 
-    match serde_json::from_str::<Account>(&content) {
-        Ok(account) => Ok(account),
+    let mut account = match serde_json::from_str::<Account>(&content) {
+        Ok(account) => account,
         Err(e) => {
             let err_msg = e.to_string();
             // Self-healing attempt: handle trailing characters / extra closing brackets
-            if err_msg.contains("trailing characters") || err_msg.contains("trailing comma") || err_msg.contains("trailing") {
+            if err_msg.contains("trailing characters")
+                || err_msg.contains("trailing comma")
+                || err_msg.contains("trailing")
+            {
                 let mut de = serde_json::Deserializer::from_str(&content);
                 if let Ok(account) = serde::Deserialize::deserialize(&mut de) {
                     crate::modules::logger::log_warn(&format!(
@@ -724,9 +1156,24 @@ fn load_account_at_path(account_path: &PathBuf) -> Result<Account, String> {
                     return Ok(account);
                 }
             }
-            Err(format!("failed_to_parse_account_data: {}", err_msg))
+            return Err(format!("failed_to_parse_account_data: {}", err_msg));
+        }
+    };
+
+    // Self-healing: if subscription_tier is missing or unnormalized, heal it and persist to disk
+    if let Some(ref mut quota) = account.quota {
+        let original_tier = quota.subscription_tier.clone();
+        quota.ensure_subscription_tier();
+        if quota.subscription_tier != original_tier {
+            crate::modules::logger::log_info(&format!(
+                "Self-healing subscription tier for account {} ({:?} -> {:?})",
+                account.email, original_tier, quota.subscription_tier
+            ));
+            let _ = save_account_at_path(account_path, &account);
         }
     }
+
+    Ok(account)
 }
 
 /// Load account index with recovery support
@@ -834,6 +1281,15 @@ pub fn save_account(account: &Account) -> Result<(), String> {
     save_account_at_path(&account_path, account)
 }
 
+/// Save proxy selection priority using the shared account write lock.
+pub fn update_account_priority(account_id: &str, priority: u8) -> Result<(), String> {
+    crate::models::account::validate_priority(priority)?;
+    let _account_write = lock_account_file_updates()?;
+    let mut account = load_account(account_id)?;
+    account.priority = priority;
+    save_account(&account)
+}
+
 /// List all accounts
 pub fn list_accounts() -> Result<Vec<Account>, String> {
     crate::modules::logger::log_info("Listing accounts...");
@@ -855,7 +1311,20 @@ pub fn list_accounts() -> Result<Vec<Account>, String> {
         }
     }
 
+    if let Err(error) = crate::modules::token_stats::populate_weekly_usage(&mut accounts) {
+        tracing::warn!("Weekly token usage unavailable: {}", error);
+    }
     Ok(accounts)
+}
+
+/// Resolve persisted CLI credentials without changing any client's login state.
+pub fn find_agy_account(accounts: Vec<Account>, refresh_token: &str) -> Result<Account, String> {
+    accounts
+        .into_iter()
+        .find(|account| !refresh_token.is_empty() && account.token.refresh_token == refresh_token)
+        .ok_or_else(|| {
+            "The agy keyring credentials do not match a managed account; import the current login before syncing.".into()
+        })
 }
 
 /// Add account
@@ -1573,9 +2042,13 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                 }
 
                 for std_id in &config.quota_protection.monitored_models {
-                    let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
-                        .unwrap_or_else(|| std_id.clone());
-                    let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
+                    let lookup_key =
+                        crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
+                            .unwrap_or_else(|| std_id.clone());
+                    let max_pct = group_max_percentage
+                        .get(&lookup_key)
+                        .cloned()
+                        .unwrap_or(100);
 
                     if max_pct < threshold {
                         if !account.protected_models.contains(&lookup_key) {

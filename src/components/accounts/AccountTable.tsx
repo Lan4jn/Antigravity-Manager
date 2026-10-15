@@ -49,12 +49,13 @@ import {
     ArrowUp,
     ArrowDown,
 } from 'lucide-react';
-import type { Account, ModelQuota } from '../../types/account';
+import { type Account, type ModelQuota, getAccountTier } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
+import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
 import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
 import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
@@ -353,10 +354,10 @@ function AccountRowContent({
     const weeklyItems = useMemo(() => {
         if (quotaWindow !== 'weekly') return [];
         return (account.quota?.quota_groups || []).flatMap(group => {
-            return group.buckets
+            return (group.buckets || [])
                 .filter(b => b.window.toLowerCase().includes('week') || b.bucket_id.toLowerCase().includes('week'))
                 .map(b => {
-                    const shortGroupName = group.display_name
+                    const shortGroupName = (group.display_name || '')
                         .replace(/ models?$/i, '')
                         .replace(/Claude and GPT/i, 'Claude/GPT');
                     return {
@@ -364,6 +365,7 @@ function AccountRowContent({
                         label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
                         percentage: Math.round((b.remaining_fraction || 0) * 100),
                         resetTime: b.reset_time,
+                        cycleTokens: b.cycle_tokens,
                         Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
                     };
                 });
@@ -482,16 +484,16 @@ function AccountRowContent({
 
 
                         {/* 订阅类型徽章 */}
-                        {account.quota?.subscription_tier && (() => {
-                            const tier = account.quota.subscription_tier.toLowerCase();
-                            if (tier.includes('ultra')) {
+                        {(() => {
+                            const tier = getAccountTier(account);
+                            if (tier === 'ultra') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Gem className="w-2.5 h-2.5 fill-current" />
                                         {t('accounts.ultra')}
                                     </span>
                                 );
-                            } else if (tier.includes('pro')) {
+                            } else if (tier === 'pro') {
                                 return (
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Diamond className="w-2.5 h-2.5 fill-current" />
@@ -508,6 +510,9 @@ function AccountRowContent({
                             }
                         })()}
                         {/* 自定义标签 */}
+                        <span className="px-2 py-0.5 rounded-md bg-gray-100 dark:bg-base-300 text-gray-500 dark:text-gray-400 text-[10px] font-bold" title={t('accounts.priority_hint')}>
+                            {t('accounts.priority')}: {account.priority ?? 50}
+                        </span>
                         {account.custom_label && !isEditingLabel && (
                             <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[10px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
                                 <Tag className="w-2.5 h-2.5" />
@@ -591,19 +596,20 @@ function AccountRowContent({
                                     label={item.label}
                                     percentage={item.percentage}
                                     resetTime={item.resetTime}
+                                    weeklyTokens={item.cycleTokens ?? null}
                                     Icon={item.Icon}
                                 />
                             ))
                         ) : (
                             displayModels.map((model) => {
                                 const modelData = model.data;
+                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups);
 
                                 return (
                                     <QuotaItem
                                         key={model.id}
                                         label={model.label}
-                                        percentage={modelData?.percentage || 0}
-                                        resetTime={modelData?.reset_time}
+                                        {...display}
                                         isProtected={Boolean(config?.quota_protection?.enabled && isModelProtected(account.protected_models, model.protectedKey))}
                                         liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                         Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
@@ -668,7 +674,7 @@ function AccountRowContent({
                     )}
                     <button
                         className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch(); }}
+                        onClick={(e) => { e.stopPropagation(); onSwitch('classic'); }}
                         title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)'))}
                         disabled={isSwitching || isDisabled}
                     >

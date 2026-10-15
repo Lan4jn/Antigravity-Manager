@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
+
+// Admission happens before spawn_blocking, so queued tasks cannot retain unlimited bodies.
+static LOG_WRITERS: Semaphore = Semaphore::const_new(4);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
@@ -18,12 +22,238 @@ pub struct ProxyRequestLog {
     pub client_ip: Option<String>, // 客户端 IP 地址
     pub error: Option<String>,
     pub request_body: Option<String>,
+    pub upstream_request_body: Option<String>, // 网关转出给上游(Antigravity)的报文
     pub response_body: Option<String>,
+    #[serde(default)]
+    pub request_headers: Option<String>,
+    #[serde(default)]
+    pub upstream_request_headers: Option<String>,
+    #[serde(default)]
+    pub response_headers: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
+    #[serde(default)]
+    pub session_id: Option<String>, // 会话标识 (如 sess-xxx)
+}
+
+#[cfg(test)]
+pub(crate) mod prompt_log_tests {
+    use super::*;
+
+    pub(crate) fn sample_log(id: &str, bytes: usize) -> ProxyRequestLog {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "timestamp": chrono::Utc::now().timestamp_millis(),
+            "method": "POST", "url": "/v1/chat/completions", "status": 500, "duration": 10,
+            "request_body": "q".repeat(bytes), "response_body": "错".repeat(bytes),
+            "error": "错".repeat(2048)
+        }))
+        .unwrap()
+    }
+
+    // Tests using ABV_DATA_DIR run serially and restore the previous process setting.
+    // Unified with crate::modules::account::SHARED_TEST_ENV_LOCK to prevent split-brain mutex race.
+    thread_local! {
+        static REENTRANCY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) struct TestDataDir {
+        _guard: Option<std::sync::MutexGuard<'static, ()>>,
+        _dir: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl TestDataDir {
+        pub(crate) fn new() -> Self {
+            let depth = REENTRANCY_DEPTH.get();
+            let guard = if depth == 0 {
+                Some(
+                    crate::modules::account::SHARED_TEST_ENV_LOCK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                )
+            } else {
+                None
+            };
+            REENTRANCY_DEPTH.set(depth + 1);
+
+            let dir = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("ABV_DATA_DIR");
+            std::env::set_var("ABV_DATA_DIR", dir.path());
+            Self {
+                _guard: guard,
+                _dir: dir,
+                previous,
+            }
+        }
+    }
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("ABV_DATA_DIR", previous);
+            } else {
+                std::env::remove_var("ABV_DATA_DIR");
+            }
+            let depth = REENTRANCY_DEPTH.get();
+            if depth > 0 {
+                REENTRANCY_DEPTH.set(depth - 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_log_memory_summary_and_database_detail() {
+        let _dir = TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        let monitor = ProxyMonitor {
+            logs: RwLock::new(VecDeque::new()),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs: 2,
+            enabled: Arc::new(AtomicBool::new(true)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+            app_handle: None,
+        };
+        let log = sample_log("detail", 4096);
+        let response = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log.response_body.clone(),
+            &crate::proxy::config::get_payload_storage_mode(),
+        );
+        monitor.log_request(log).await;
+        let _finished = LOG_WRITERS.acquire_many(4).await.unwrap();
+        let logs = monitor.logs.read().await;
+        assert!(logs[0].request_body.is_none() && logs[0].response_body.is_none());
+        assert_eq!(logs[0].error.as_ref().unwrap().chars().count(), 1024);
+        let detail = crate::modules::proxy_db::get_log_detail("detail").unwrap();
+        assert_eq!(detail.response_body, response);
+        assert_eq!(
+            detail.request_body.as_deref(),
+            Some("q".repeat(4096).as_str())
+        );
+        monitor.set_enabled(false);
+        monitor.log_request(sample_log("disabled", 4096)).await;
+        assert!(crate::modules::proxy_db::get_log_detail("disabled").is_err());
+    }
+}
+
+impl ProxyRequestLog {
+    pub(crate) fn summary(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            timestamp: self.timestamp,
+            method: self.method.clone(),
+            url: self.url.clone(),
+            status: self.status,
+            duration: self.duration,
+            model: self.model.clone(),
+            mapped_model: self.mapped_model.clone(),
+            account_email: self.account_email.clone(),
+            client_ip: self.client_ip.clone(),
+            error: self
+                .error
+                .as_ref()
+                .map(|error| error.chars().take(1024).collect()),
+            request_body: None,
+            upstream_request_body: None,
+            response_body: None,
+            request_headers: None,
+            upstream_request_headers: None,
+            response_headers: None,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_tokens: self.cached_tokens,
+            protocol: self.protocol.clone(),
+            username: self.username.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct UpstreamCapture {
+    body: Option<String>,
+    headers: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct UpstreamRequestBodyHolder(pub std::sync::Arc<std::sync::Mutex<UpstreamCapture>>);
+
+tokio::task_local! {
+    pub static CURRENT_UPSTREAM_CAPTURE: UpstreamRequestBodyHolder;
+}
+
+impl UpstreamRequestBodyHolder {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            UpstreamCapture::default(),
+        )))
+    }
+
+    pub fn set(&self, body: String) {
+        if let Ok(mut lock) = self.0.lock() {
+            lock.body = Some(body);
+        }
+    }
+
+    pub fn set_headers_json(&self, headers: String) {
+        if let Ok(mut lock) = self.0.lock() {
+            lock.headers = Some(headers);
+        }
+    }
+
+    pub fn set_value(&self, val: &serde_json::Value) {
+        let clean = sanitize_upstream_debug_value(val);
+        if let Ok(s) = serde_json::to_string(&clean) {
+            self.set(s);
+        }
+    }
+
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut g| g.body.take())
+    }
+
+    pub fn take_headers(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut g| g.headers.take())
+    }
+}
+
+fn sanitize_upstream_debug_value(val: &serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s)
+            if s.starts_with("data:image/") || s.starts_with("data:audio/") =>
+        {
+            serde_json::Value::String(format!("[inline data omitted: {} chars]", s.len()))
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sanitize_upstream_debug_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let is_inline = map
+                .get("mimeType")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && map
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some();
+            serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| {
+                        let v = if is_inline && k == "data" {
+                            serde_json::Value::String(format!(
+                                "[inline data omitted: {} chars]",
+                                v.as_str().map(str::len).unwrap_or_default()
+                            ))
+                        } else {
+                            sanitize_upstream_debug_value(v)
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect(),
+            )
+        }
+        _ => val.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -33,31 +263,12 @@ pub struct ProxyStats {
     pub error_count: u64,
 }
 
-/// 常驻内存的请求/响应体最大字节数（16KB），超出则截断，防止大 prompt/response 膨胀撑爆内存
-const MAX_MEMORY_BODY_BYTES: usize = 16 * 1024;
-
-const TRUNCATION_SUFFIX: &str = "... [TRUNCATED FOR IN-MEMORY CACHE]";
-
-fn truncate_str_safe(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        s.to_string()
-    } else {
-        let mut truncate_at = max_bytes;
-        while truncate_at > 0 && !s.is_char_boundary(truncate_at) {
-            truncate_at -= 1;
-        }
-        let mut out = String::with_capacity(truncate_at + TRUNCATION_SUFFIX.len());
-        out.push_str(&s[..truncate_at]);
-        out.push_str(TRUNCATION_SUFFIX);
-        out
-    }
-}
-
 pub struct ProxyMonitor {
     pub logs: RwLock<VecDeque<ProxyRequestLog>>,
     pub stats: RwLock<ProxyStats>,
     pub max_logs: usize,
-    pub enabled: AtomicBool,
+    pub enabled: Arc<AtomicBool>,
+    pub capture_health_logs: Arc<AtomicBool>,
     app_handle: Option<tauri::AppHandle>,
 }
 
@@ -68,6 +279,7 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
+        let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
         let retention = crate::modules::config::load_app_config()
             .map(|config| config.proxy.log_retention)
             .unwrap_or_default();
@@ -86,6 +298,24 @@ impl ProxyMonitor {
                     tracing::error!("Failed to cleanup old logs: {}", e);
                 }
             }
+            match crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            "Auto cleanup: removed {} old thinking/signature records (>{} days)",
+                            deleted,
+                            thinking_days
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to cleanup thinking records: {}", e);
+                }
+            }
+            crate::modules::logger::sync_internal_error_log_budget_from_config();
+            if let Err(e) = crate::modules::logger::apply_internal_error_log_retention() {
+                tracing::error!("Failed to apply internal error log retention: {}", e);
+            }
         });
 
         tokio::spawn(async {
@@ -93,21 +323,49 @@ impl ProxyMonitor {
             interval.tick().await;
             loop {
                 interval.tick().await;
+                let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
                 let retention = crate::modules::config::load_app_config()
                     .map(|config| config.proxy.log_retention)
                     .unwrap_or_default();
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::modules::proxy_db::apply_retention(&retention)
+                    let retention_res = crate::modules::proxy_db::apply_retention(&retention);
+                    let thinking_res =
+                        crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days);
+                    crate::modules::logger::sync_internal_error_log_budget_from_config();
+                    let error_log_res =
+                        crate::modules::logger::apply_internal_error_log_retention();
+                    (retention_res, thinking_res, error_log_res)
                 })
                 .await;
                 match result {
-                    Ok(Ok((cleared, deleted))) => tracing::info!(
-                        "Proxy log retention: cleared {} bodies, deleted {} rows",
-                        cleared,
-                        deleted
-                    ),
-                    Ok(Err(error)) => {
-                        tracing::error!("Failed to apply proxy log retention: {}", error)
+                    Ok((retention_res, thinking_res, error_log_res)) => {
+                        match retention_res {
+                            Ok((cleared, deleted)) => {
+                                if cleared > 0 || deleted > 0 {
+                                    tracing::info!(
+                                        "Proxy log retention: cleared {} bodies, deleted {} rows",
+                                        cleared,
+                                        deleted
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!("Failed to apply proxy log retention: {}", error)
+                            }
+                        }
+                        if let Ok(deleted) = thinking_res {
+                            if deleted > 0 {
+                                tracing::info!(
+                                    "Auto cleanup: removed {} old thinking/signature records",
+                                    deleted
+                                );
+                            }
+                        } else if let Err(e) = thinking_res {
+                            tracing::error!("Failed to cleanup thinking records: {}", e);
+                        }
+                        if let Err(e) = error_log_res {
+                            tracing::error!("Failed to apply internal error log retention: {}", e);
+                        }
                     }
                     Err(error) => tracing::error!("Proxy log retention task failed: {}", error),
                 }
@@ -118,7 +376,8 @@ impl ProxyMonitor {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),
             stats: RwLock::new(ProxyStats::default()),
             max_logs,
-            enabled: AtomicBool::new(false), // Default to disabled
+            enabled: Arc::new(AtomicBool::new(false)), // Default to disabled
+            capture_health_logs: Arc::new(AtomicBool::new(false)), // Default to false
             app_handle,
         }
     }
@@ -129,6 +388,14 @@ impl ProxyMonitor {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_capture_health_logs(&self, enabled: bool) {
+        self.capture_health_logs.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_capture_health_logs(&self) -> bool {
+        self.capture_health_logs.load(Ordering::Relaxed)
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
@@ -162,64 +429,65 @@ impl ProxyMonitor {
             }
         }
 
-        // Add log to memory (with truncation for memory efficiency)
+        let summary = log.summary();
+        // Add only the same summary used by the frontend to memory.
         {
-            let memory_log = ProxyRequestLog {
-                id: log.id.clone(),
-                timestamp: log.timestamp,
-                method: log.method.clone(),
-                url: log.url.clone(),
-                status: log.status,
-                duration: log.duration,
-                model: log.model.clone(),
-                mapped_model: log.mapped_model.clone(),
-                account_email: log.account_email.clone(),
-                client_ip: log.client_ip.clone(),
-                error: log.error.clone(),
-                request_body: log
-                    .request_body
-                    .as_deref()
-                    .map(|s| truncate_str_safe(s, MAX_MEMORY_BODY_BYTES)),
-                response_body: log
-                    .response_body
-                    .as_deref()
-                    .map(|s| truncate_str_safe(s, MAX_MEMORY_BODY_BYTES)),
-                input_tokens: log.input_tokens,
-                output_tokens: log.output_tokens,
-                cached_tokens: log.cached_tokens,
-                protocol: log.protocol.clone(),
-                username: log.username.clone(),
-            };
-
             let mut logs = self.logs.write().await;
             if logs.len() >= self.max_logs {
                 logs.pop_back();
             }
-            logs.push_front(memory_log);
+            logs.push_front(summary.clone());
         }
 
-        // Save to DB
-        let log_to_save = log.clone();
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("proxy://request", &summary);
+        }
+
+        let Ok(permit) = LOG_WRITERS.try_acquire() else {
+            tracing::debug!("Skipping proxy log persistence: writers busy");
+            return;
+        };
+        // Save to DB (respect server-side simple/full storage mode)
+        let mut log_to_save = log;
+        let storage_mode = crate::proxy::config::get_payload_storage_mode();
+        log_to_save.request_body = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log_to_save.request_body,
+            &storage_mode,
+        );
+        log_to_save.upstream_request_body = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log_to_save.upstream_request_body,
+            &storage_mode,
+        );
+        log_to_save.response_body = crate::proxy::payload_audit::apply_storage_mode_to_body(
+            log_to_save.response_body,
+            &storage_mode,
+        );
+
+        let enabled = Arc::clone(&self.enabled);
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
+            let _permit = permit;
+            if !enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Err(e) = crate::modules::proxy_db::save_log(log_to_save) {
                 tracing::error!("Failed to save proxy log to DB: {}", e);
             }
 
             // Sync to Security DB (IpAccessLogs) so it appears in Security Monitor
-            if let Some(ip) = &log_to_save.client_ip {
+            if let Some(ip) = &summary.client_ip {
                 let security_log = crate::modules::security_db::IpAccessLog {
                     id: uuid::Uuid::new_v4().to_string(),
                     client_ip: ip.clone(),
-                    timestamp: log_to_save.timestamp / 1000, // ms to s
-                    method: Some(log_to_save.method.clone()),
-                    path: Some(log_to_save.url.clone()),
+                    timestamp: summary.timestamp / 1000, // ms to s
+                    method: Some(summary.method.clone()),
+                    path: Some(summary.url.clone()),
                     user_agent: None, // We don't have UA in ProxyRequestLog easily accessible here without plumbing
-                    status: Some(log_to_save.status as i32),
-                    duration: Some(log_to_save.duration as i64),
+                    status: Some(summary.status as i32),
+                    duration: Some(summary.duration as i64),
                     api_key_hash: None,
                     blocked: false, // This comes from monitor, so it wasn't blocked by IP filter
                     block_reason: None,
-                    username: log_to_save.username.clone(),
+                    username: summary.username.clone(),
                 };
 
                 if let Err(e) = crate::modules::security_db::save_ip_access_log(&security_log) {
@@ -227,31 +495,6 @@ impl ProxyMonitor {
                 }
             }
         });
-
-        // Emit event (send summary only, without body to reduce memory)
-        if let Some(app) = &self.app_handle {
-            let log_summary = ProxyRequestLog {
-                id: log.id.clone(),
-                timestamp: log.timestamp,
-                method: log.method.clone(),
-                url: log.url.clone(),
-                status: log.status,
-                duration: log.duration,
-                model: log.model.clone(),
-                mapped_model: log.mapped_model.clone(),
-                account_email: log.account_email.clone(),
-                client_ip: log.client_ip.clone(),
-                error: log.error.clone(),
-                request_body: None,  // Don't send body in event
-                response_body: None, // Don't send body in event
-                input_tokens: log.input_tokens,
-                output_tokens: log.output_tokens,
-                cached_tokens: log.cached_tokens,
-                protocol: log.protocol.clone(),
-                username: log.username.clone(),
-            };
-            let _ = app.emit("proxy://request", &log_summary);
-        }
     }
 
     pub async fn get_logs(&self, limit: usize) -> Vec<ProxyRequestLog> {
@@ -333,44 +576,139 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_str_safe_a1_a2() {
-        // A1: 10 MiB 正文得到合法预览，capacity 达到 G1 上限；原正文不变
-        let orig_10m = "A".repeat(10 * 1024 * 1024);
-        let prev_10m = truncate_str_safe(&orig_10m, MAX_MEMORY_BODY_BYTES);
-        assert!(prev_10m.ends_with(TRUNCATION_SUFFIX));
-        assert_eq!(prev_10m.len(), MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
-        assert!(prev_10m.capacity() <= MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
-        assert_eq!(orig_10m.len(), 10 * 1024 * 1024, "原 10 MiB 正文不被修改");
-
-        // A2: 空/None/短文本大 capacity / 恰好上限 / 中文与 emoji 4 字节边界
-        assert_eq!(truncate_str_safe("", 16384), "");
-
-        let exact_str = "X".repeat(MAX_MEMORY_BODY_BYTES);
-        let exact_prev = truncate_str_safe(&exact_str, MAX_MEMORY_BODY_BYTES);
-        assert_eq!(exact_prev.len(), MAX_MEMORY_BODY_BYTES);
-        assert!(!exact_prev.contains(TRUNCATION_SUFFIX));
-
-        // 短文本带 10MB capacity 被紧凑化构造，不带入空闲容量
-        let mut short_with_huge_cap = String::with_capacity(10 * 1024 * 1024);
-        short_with_huge_cap.push_str("short payload");
-        let short_prev = truncate_str_safe(&short_with_huge_cap, MAX_MEMORY_BODY_BYTES);
-        assert_eq!(short_prev, "short payload");
-        assert!(short_prev.capacity() < 64);
-
-        // 中文多字节截断 (3 字节/字符)
-        let cn_str = "这是一段测试中文文本，用于验证多字节截断安全";
-        let cn_prev = truncate_str_safe(cn_str, 10);
-        assert!(cn_prev.ends_with(TRUNCATION_SUFFIX));
-
-        // Emoji 边界截断 (4 字节/字符: 🦀 = 0xF0 0x9F 0xA6 0x80)
-        let emoji_str = "🦀".repeat(5000); // 20,000 字节
-        let emoji_prev = truncate_str_safe(&emoji_str, MAX_MEMORY_BODY_BYTES);
-        assert!(emoji_prev.ends_with(TRUNCATION_SUFFIX));
-        assert!(emoji_prev.len() <= MAX_MEMORY_BODY_BYTES + TRUNCATION_SUFFIX.len());
+    fn test_summary_preserves_metadata_without_payload_allocations() {
+        let mut log = prompt_log_tests::sample_log("summary", 4096);
+        log.upstream_request_body = Some("upstream".repeat(4096));
+        log.request_headers = Some("request headers".to_string());
+        log.upstream_request_headers = Some("upstream headers".to_string());
+        log.response_headers = Some("response headers".to_string());
+        log.session_id = Some("session-summary".to_string());
+        log.input_tokens = Some(10000);
+        log.output_tokens = Some(150);
+        log.cached_tokens = Some(8800);
+        let summary = log.summary();
+        for body in [
+            &summary.request_body,
+            &summary.upstream_request_body,
+            &summary.response_body,
+            &summary.request_headers,
+            &summary.upstream_request_headers,
+            &summary.response_headers,
+        ] {
+            assert!(body.is_none());
+        }
+        assert_eq!(summary.session_id, log.session_id);
+        assert_eq!(summary.duration, log.duration);
+        assert_eq!(summary.input_tokens, log.input_tokens);
+        assert_eq!(summary.output_tokens, log.output_tokens);
+        assert_eq!(summary.cached_tokens, log.cached_tokens);
+        assert_eq!(summary.error.as_ref().unwrap().chars().count(), 1024);
+        assert!(log.request_body.is_some());
+        assert!(log.upstream_request_headers.is_some());
     }
 
     #[tokio::test]
-    async fn test_monitor_memory_log_capacity_and_truncation() {
+    async fn test_monitor_busy_writers_keep_summary_and_resume_persistence() {
+        use crate::proxy::config;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let _dir = prompt_log_tests::TestDataDir::new();
+        struct RestoreAuditConfig(String, u32, bool, u32, u32);
+        impl RestoreAuditConfig {
+            fn set_storage_mode(&self, mode: &str) {
+                config::update_global_audit_config(
+                    mode.to_string(),
+                    self.1,
+                    self.2,
+                    self.3,
+                    Some(self.4),
+                );
+            }
+        }
+        impl Drop for RestoreAuditConfig {
+            fn drop(&mut self) {
+                self.set_storage_mode(&self.0);
+            }
+        }
+        let audit_config = RestoreAuditConfig(
+            config::get_payload_storage_mode(),
+            config::get_log_retention_days(),
+            config::is_thinking_store_enabled(),
+            config::get_thinking_retention_days(),
+            config::get_thinking_max_memory_turns() as u32,
+        );
+        crate::modules::proxy_db::init_db().unwrap();
+        let monitor = ProxyMonitor {
+            logs: RwLock::new(VecDeque::new()),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs: 4,
+            enabled: Arc::new(AtomicBool::new(true)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+            app_handle: None,
+        };
+        let body = "原文🦀".repeat(4000);
+        for mode in ["full", "simple"] {
+            audit_config.set_storage_mode(mode);
+            let busy_id = format!("busy_{mode}_{}", uuid::Uuid::new_v4());
+            let permits = timeout(Duration::from_secs(5), LOG_WRITERS.acquire_many(4))
+                .await
+                .expect("existing log writers did not finish")
+                .unwrap();
+            let mut busy = prompt_log_tests::sample_log(&busy_id, 4096);
+            busy.response_body = Some(body.clone());
+            busy.cached_tokens = Some(8800);
+            timeout(Duration::from_secs(1), monitor.log_request(busy))
+                .await
+                .expect("busy writers must not block log_request");
+            {
+                let logs = monitor.logs.read().await;
+                let summary = logs
+                    .iter()
+                    .find(|log| log.id == busy_id)
+                    .expect("writer admission must happen after memory summary insertion");
+                assert!(summary.request_body.is_none());
+                assert!(summary.response_body.is_none());
+                assert_eq!(summary.cached_tokens, Some(8800));
+            }
+            assert!(crate::modules::proxy_db::get_log_detail(&busy_id).is_err());
+            drop(permits);
+
+            let accepted_id = format!("accepted_{mode}_{}", uuid::Uuid::new_v4());
+            let mut accepted = prompt_log_tests::sample_log(&accepted_id, 4096);
+            accepted.request_body = Some(body.clone());
+            accepted.upstream_request_body = Some(body.clone());
+            accepted.response_body = Some(body.clone());
+            timeout(Duration::from_secs(1), monitor.log_request(accepted))
+                .await
+                .expect("free writers must accept a new log");
+            let _finished = timeout(Duration::from_secs(5), LOG_WRITERS.acquire_many(4))
+                .await
+                .expect("accepted log writer did not finish")
+                .unwrap();
+            let detail = crate::modules::proxy_db::get_log_detail(&accepted_id)
+                .expect("new request must persist after writer permits are released");
+            let expected = if mode == "full" {
+                body.clone()
+            } else {
+                format!("{}…", body.chars().take(8000).collect::<String>())
+            };
+            assert_eq!(detail.request_body.as_deref(), Some(expected.as_str()));
+            assert_eq!(
+                detail.upstream_request_body.as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(detail.response_body.as_deref(), Some(expected.as_str()));
+            assert!(
+                crate::modules::proxy_db::get_log_detail(&busy_id).is_err(),
+                "the dropped busy log must not be queued for later persistence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_monitor_memory_log_capacity_and_summary() {
+        let _dir = prompt_log_tests::TestDataDir::new();
         let monitor = ProxyMonitor::new(2, None);
         monitor.set_enabled(true);
 
@@ -387,6 +725,11 @@ mod tests {
             client_ip: None,
             request_body: Some("B".repeat(20 * 1024)),
             response_body: Some("C".repeat(30 * 1024)),
+            upstream_request_body: None,
+            request_headers: None,
+            upstream_request_headers: None,
+            response_headers: None,
+            session_id: None,
             input_tokens: None,
             output_tokens: None,
             cached_tokens: None,
@@ -401,8 +744,8 @@ mod tests {
             let logs = monitor.logs.read().await;
             assert_eq!(logs.len(), 1);
             let first = &logs[0];
-            assert!(first.request_body.as_ref().unwrap().contains("[TRUNCATED"));
-            assert!(first.response_body.as_ref().unwrap().contains("[TRUNCATED"));
+            assert!(first.request_body.is_none());
+            assert!(first.response_body.is_none());
         }
 
         // 插入第2和第3条，验证最大容量为 2
@@ -417,16 +760,23 @@ mod tests {
             assert_eq!(logs[0].id, "3");
             assert_eq!(logs[1].id, "2");
         }
+        let _finished = LOG_WRITERS.acquire_many(4).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_monitor_db_persists_and_reads_back_full_body() {
+        let _dir = prompt_log_tests::TestDataDir::new();
         let monitor = ProxyMonitor::new(10, None);
         monitor.set_enabled(true);
 
         let unique_id = format!("test_db_full_{}", uuid::Uuid::new_v4());
-        let full_req_body = "REQ_DATA_".repeat(5000); // 45KB
-        let full_resp_body = "RESP_DATA_".repeat(6000); // 60KB
+        let full_req_body =
+            serde_json::to_string_pretty(&serde_json::json!({"content": "REQ_DATA_".repeat(5000)}))
+                .unwrap(); // 45KB
+        let full_resp_body = serde_json::to_string_pretty(
+            &serde_json::json!({"content": "RESP_DATA_".repeat(6000)}),
+        )
+        .unwrap(); // 60KB
 
         let log = ProxyRequestLog {
             id: unique_id.clone(),
@@ -441,6 +791,11 @@ mod tests {
             client_ip: None,
             request_body: Some(full_req_body.clone()),
             response_body: Some(full_resp_body.clone()),
+            upstream_request_body: Some("upstream complete body".to_string()),
+            request_headers: Some("{\"x-request\":\"full\"}".to_string()),
+            upstream_request_headers: Some("{\"x-upstream\":\"full\"}".to_string()),
+            response_headers: Some("{\"x-timing-total-ms\":\"120.000\"}".to_string()),
+            session_id: Some("session-full".to_string()),
             input_tokens: Some(100),
             output_tokens: Some(200),
             cached_tokens: None,
@@ -465,21 +820,50 @@ mod tests {
         }
         let db_detail = db_entry.expect("DB entry must be persisted within timeout");
 
-        // 验证内存中保留的是截断预览
+        // 内存与事件统一为summary；DB保留完整正文和headers。
         {
             let logs = monitor.logs.read().await;
-            let mem_entry = logs.iter().find(|l| l.id == unique_id).expect("Memory entry must exist");
-            assert!(mem_entry.request_body.as_ref().unwrap().contains("[TRUNCATED"));
-            assert!(mem_entry.response_body.as_ref().unwrap().contains("[TRUNCATED"));
+            let mem_entry = logs
+                .iter()
+                .find(|l| l.id == unique_id)
+                .expect("Memory entry must exist");
+            assert!(mem_entry.request_body.is_none());
+            assert!(mem_entry.response_body.is_none());
+            assert!(mem_entry.response_headers.is_none());
+            assert_eq!(mem_entry.session_id.as_deref(), Some("session-full"));
         }
 
         // 验证从 SQLite 数据库读回的是未截断的完整正文
-        assert_eq!(db_detail.request_body.as_deref(), Some(full_req_body.as_str()));
-        assert_eq!(db_detail.response_body.as_deref(), Some(full_resp_body.as_str()));
+        assert_eq!(
+            db_detail.request_body.as_deref(),
+            Some(full_req_body.as_str())
+        );
+        assert_eq!(
+            db_detail.response_body.as_deref(),
+            Some(full_resp_body.as_str())
+        );
+        assert_eq!(
+            db_detail.upstream_request_body.as_deref(),
+            Some("upstream complete body")
+        );
+        assert_eq!(
+            db_detail.request_headers.as_deref(),
+            Some("{\"x-request\":\"full\"}")
+        );
+        assert_eq!(
+            db_detail.upstream_request_headers.as_deref(),
+            Some("{\"x-upstream\":\"full\"}")
+        );
+        assert_eq!(
+            db_detail.response_headers.as_deref(),
+            Some("{\"x-timing-total-ms\":\"120.000\"}")
+        );
+        assert_eq!(db_detail.session_id.as_deref(), Some("session-full"));
     }
 
     #[tokio::test]
     async fn test_monitor_100_logs_window_capacity_bounded() {
+        let _dir = prompt_log_tests::TestDataDir::new();
         let monitor = ProxyMonitor::new(100, None);
         monitor.set_enabled(true);
 
@@ -505,6 +889,11 @@ mod tests {
                 client_ip: None,
                 request_body: Some(req),
                 response_body: Some(resp),
+                upstream_request_body: None,
+                request_headers: None,
+                upstream_request_headers: None,
+                response_headers: None,
+                session_id: None,
                 input_tokens: None,
                 output_tokens: None,
                 cached_tokens: None,
@@ -526,14 +915,11 @@ mod tests {
             })
             .sum();
 
-        // 100 logs * 2 bodies * (16KB + suffix) ≈ 3.3 MB max
-        let max_expected = 100 * 2 * (MAX_MEMORY_BODY_BYTES + 64);
-        assert!(
-            total_cap <= max_expected,
-            "Total in-memory capacity must be <= {}, but was {}",
-            max_expected,
-            total_cap
+        assert_eq!(
+            total_cap, 0,
+            "Summary window must retain no body allocations"
         );
-        assert!(total_cap < 4 * 1024 * 1024);
+        drop(logs);
+        let _finished = LOG_WRITERS.acquire_many(4).await.unwrap();
     }
 }

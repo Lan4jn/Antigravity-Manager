@@ -1053,4 +1053,3 @@ mod tests {
         assert_eq!(m1.shared_config().read().await.health_check_interval, 77);
     }
 }
-

@@ -506,7 +506,9 @@ impl CacheManager {
             let before = self.prefix_tracker.len();
             let now = Instant::now();
             self.prefix_tracker.retain(|_, v| v.expires_at > now);
-            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| v.last_accessed);
+            evict_oldest_dashmap(&self.prefix_tracker, PREFIX_TRACKER_LIMIT, |v| {
+                v.last_accessed
+            });
             let after = self.prefix_tracker.len();
             if before != after {
                 tracing::debug!(
@@ -1013,7 +1015,7 @@ mod tests {
         // prefix entry removed, SI and tools still valid (30min TTL)
         assert_eq!(evicted, 1, "Only prefix should be evicted");
 
-        // should be expired and gone
+        // should be expired and removed
         assert!(cm.lookup_prefix("prefix_key").is_none());
 
         let stats = cm.get_layer_stats();
